@@ -72,6 +72,7 @@
 #define PACKET_BUF_SIZE   65536
 #define MASQUE_FRAME_BUF  (PACKET_BUF_SIZE + 16)
 #define MAX_CAPSULE_BUF   65536
+#define MAX_ADDRESS_REQUEST_IDS ((size_t)MQVPN_MAX_ROUTES + 2u)
 
 /* ─── Forward declarations ─── */
 
@@ -141,6 +142,13 @@ struct svr_conn_s {
 
     /* MASQUE session */
     char username[64]; /* authenticated user name, or empty for global key */
+    /* Canonical authorization principal.  This is deliberately separate from
+     * username: username is also used as the display/lease name and a holder
+     * of the global PSK may supply it via the untrusted x-user header.  Only a
+     * direct per-user-key match populates auth_principal, once, during the
+     * CONNECT-IP header phase.  Native routes and routed-source authorization
+     * use this field exclusively. */
+    char auth_principal[64];
     uint64_t masque_stream_id;
     /* The CONNECT-IP request stream's h3_request handle, kept around so
      * svr_push_path_label_to_client() can send a PATH_LABEL_PUSH capsule
@@ -153,6 +161,15 @@ struct svr_conn_s {
      * tunnel_established, so a stale pointer into a freed request can
      * never be used. NULL whenever there is no live CONNECT-IP stream. */
     xqc_h3_request_t *connect_ip_request;
+    /* RFC 9484 Request IDs are unique for the lifetime of one IP proxying
+     * request, not merely within one ADDRESS_REQUEST capsule.  Allocate this
+     * history lazily so pre-auth/pre-CONNECT connections pay no 4 KiB fixed
+     * cost.  The bounded capacity matches the largest request batch mqvpn is
+     * prepared to answer and turns an abusive unbounded sequence into a clean
+     * stream abort instead of unbounded per-client memory growth. */
+    uint64_t *address_request_ids;
+    size_t n_address_request_ids;
+    size_t cap_address_request_ids;
     struct in_addr assigned_ip;
     struct in6_addr assigned_ip6;
     int has_v6;
@@ -250,6 +267,10 @@ struct mqvpn_server_s {
 
     /* xquic engine */
     xqc_engine_t *engine;
+    /* Set before engine teardown.  Request-close callbacks run while
+     * xqc_engine_destroy is already destroying streams and must not requeue
+     * that same connection through xqc_h3_conn_close. */
+    int shutting_down;
 
     /* UDP socket (provided by platform via set_socket_fd) */
     int udp_fd;
@@ -276,6 +297,12 @@ struct mqvpn_server_s {
     svr_conn_t *sessions[MQVPN_ADDR_POOL_MAX + 1];
     int n_sessions;
     int max_clients;
+
+    /* Volatile binding for each immutable config route row.  Ownership stays
+     * in config.route_users[] even while its client is offline; this cache is
+     * populated only by an authenticated per-user principal and is cleared
+     * with a pointer guard on request/connection close. */
+    svr_conn_t *route_targets[MQVPN_MAX_ROUTES];
 
     /* IP lease table: remembers the last IP offset for each named user so
      * they receive the same address on reconnect. */
@@ -483,6 +510,237 @@ server_log(mqvpn_server_t *s, mqvpn_log_level_t level, const char *fmt, ...)
 #else
 #  define ASSERT_TICK_THREAD(s) ((void)0)
 #endif
+
+/* ─── Native route helpers ───
+ *
+ * The configured prefix/user arrays are the ownership table.  route_targets
+ * is only a liveness cache and is intentionally not consulted by LPM itself:
+ * a more-specific offline owner must never fall back to a less-specific live
+ * owner. */
+
+static int
+svr_cidr_is_canonical(const mqvpn_cidr_entry_t *e)
+{
+    if (!e || (e->family != 4 && e->family != 6)) return 0;
+    if ((e->family == 4 && e->prefix_len > 32) || e->prefix_len > 128) return 0;
+    if (e->family == 4) {
+        for (int i = 4; i < 16; i++) {
+            if (e->net[i] != 0) return 0;
+        }
+    }
+
+    mqvpn_cidr_entry_t canonical = *e;
+    mqvpn_cidr_premask(canonical.net, canonical.prefix_len);
+    return memcmp(canonical.net, e->net, sizeof(e->net)) == 0;
+}
+
+static int
+svr_pool_cidr(const mqvpn_server_t *s, uint8_t family, mqvpn_cidr_entry_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    if (family == 4) {
+        out->family = 4;
+        out->prefix_len = (uint8_t)s->pool.prefix_len;
+        memcpy(out->net, &s->pool.base.s_addr, 4);
+    } else if (family == 6 && s->pool.has_v6) {
+        out->family = 6;
+        out->prefix_len = (uint8_t)s->pool.prefix6;
+        memcpy(out->net, &s->pool.base6, 16);
+    } else {
+        return 0;
+    }
+    mqvpn_cidr_premask(out->net, out->prefix_len);
+    return 1;
+}
+
+static int
+svr_cidr_intersects(const mqvpn_cidr_entry_t *a, const mqvpn_cidr_entry_t *b)
+{
+    if (a->family != b->family) return 0;
+    return mqvpn_cidr_match(a, b->family, b->net) ||
+           mqvpn_cidr_match(b, a->family, a->net);
+}
+
+static int
+svr_addr_in_tunnel_pool(const mqvpn_server_t *s, uint8_t family, const uint8_t addr[16])
+{
+    mqvpn_cidr_entry_t pool;
+    return svr_pool_cidr(s, family, &pool) && mqvpn_cidr_match(&pool, family, addr);
+}
+
+/* Return the config row selected by longest-prefix match, or -1.  Equal
+ * prefixes with different owners are rejected at startup; equal duplicates
+ * for one owner are harmless, and stable first-row selection is sufficient. */
+static int
+svr_route_lpm(const mqvpn_server_t *s, uint8_t family, const uint8_t addr[16])
+{
+    int best = -1;
+    int best_prefix = -1;
+    for (int i = 0; i < s->config.n_routes; i++) {
+        const mqvpn_cidr_entry_t *route = &s->config.route_prefixes[i];
+        if ((int)route->prefix_len <= best_prefix) continue;
+        if (!mqvpn_cidr_match(route, family, addr)) continue;
+        best = i;
+        best_prefix = route->prefix_len;
+    }
+    return best;
+}
+
+static int
+svr_principal_has_routes(const mqvpn_server_t *s, const char *principal)
+{
+    if (!principal || principal[0] == '\0') return 0;
+    for (int i = 0; i < s->config.n_routes; i++) {
+        if (strcmp(s->config.route_users[i], principal) == 0) return 1;
+    }
+    return 0;
+}
+
+static int
+svr_routed_principal_busy(const mqvpn_server_t *s, const char *principal,
+                          const svr_conn_t *except)
+{
+    if (!principal || principal[0] == '\0') return 0;
+    for (int i = 0; i < s->config.n_routes; i++) {
+        if (strcmp(s->config.route_users[i], principal) != 0) continue;
+        if (s->route_targets[i] && s->route_targets[i] != except) return 1;
+    }
+    return 0;
+}
+
+static void
+svr_routes_bind_conn(mqvpn_server_t *s, svr_conn_t *conn)
+{
+    if (!conn || conn->auth_principal[0] == '\0') return;
+    for (int i = 0; i < s->config.n_routes; i++) {
+        if (strcmp(s->config.route_users[i], conn->auth_principal) == 0)
+            s->route_targets[i] = conn;
+    }
+}
+
+static void
+svr_routes_unbind_conn(mqvpn_server_t *s, const svr_conn_t *conn)
+{
+    if (!s || !conn) return;
+    for (int i = 0; i < s->config.n_routes; i++) {
+        if (s->route_targets[i] == conn) s->route_targets[i] = NULL;
+    }
+}
+
+/* A runtime fixed-IP update may move a user's reservation while an older
+ * address is still attached to its live tunnel.  Decide release by the exact
+ * address, not merely by whether that principal has some session: after
+ * A->B->C while A is active, B is reserved but not in use and must be freed. */
+static int
+svr_session_uses_ip(const mqvpn_server_t *s, const struct in_addr *ip)
+{
+    if (!s || !ip) return 0;
+    for (int i = 1; i <= MQVPN_ADDR_POOL_MAX; i++) {
+        const svr_conn_t *conn = s->sessions[i];
+        if (conn && conn->assigned_ip.s_addr == ip->s_addr) return 1;
+    }
+    return 0;
+}
+
+/* Validate the complete ownership table after both tunnel pools have been
+ * initialized.  These checks intentionally fail server construction rather
+ * than silently disabling a row: a partially applied routing/security policy
+ * is more dangerous than a visible startup failure. */
+static int
+svr_routes_validate(mqvpn_server_t *s)
+{
+    if (s->config.n_routes < 0 || s->config.n_routes > MQVPN_MAX_ROUTES) {
+        LOG_E(s, "native routes: invalid route count %d", s->config.n_routes);
+        return -1;
+    }
+    if (s->config.n_routes == 0) return 0;
+
+    /* Route ownership uses username as an authorization principal.  Once
+     * routes are enabled, principal names must therefore be lossless and
+     * unique; `(global)` is reserved for the global-PSK auth result and can
+     * never identify a named user. */
+    for (int u = 0; u < s->config.n_users; u++) {
+        const char *name = s->config.user_names[u];
+        if (!memchr(name, '\0', sizeof(s->config.user_names[u])) || name[0] == '\0' ||
+            strcmp(name, "(global)") == 0) {
+            LOG_E(s, "native routes: invalid/reserved user principal at row %d", u);
+            return -1;
+        }
+        for (int v = 0; v < u; v++) {
+            if (strcmp(name, s->config.user_names[v]) == 0) {
+                LOG_E(s, "native routes: duplicate user principal '%s'", name);
+                return -1;
+            }
+        }
+    }
+
+    for (int i = 0; i < s->config.n_routes; i++) {
+        const mqvpn_cidr_entry_t *route = &s->config.route_prefixes[i];
+        const char *owner = s->config.route_users[i];
+        if (!memchr(owner, '\0', sizeof(s->config.route_users[i])) || owner[0] == '\0') {
+            LOG_E(s, "native route %d: missing or unterminated owner", i);
+            return -1;
+        }
+        if (strcmp(owner, "(global)") == 0) {
+            LOG_E(s, "native route %d: '(global)' is a reserved owner", i);
+            return -1;
+        }
+        if (!svr_cidr_is_canonical(route)) {
+            LOG_E(s, "native route %d for '%s': malformed/non-canonical CIDR", i, owner);
+            return -1;
+        }
+        if (route->family == 6 && !s->pool.has_v6) {
+            LOG_E(s, "native route %d for '%s': IPv6 route requires Subnet6", i, owner);
+            return -1;
+        }
+
+        mqvpn_cidr_entry_t tunnel;
+        if (svr_pool_cidr(s, route->family, &tunnel) &&
+            svr_cidr_intersects(route, &tunnel)) {
+            LOG_E(s, "native route %d for '%s': prefix intersects tunnel pool", i, owner);
+            return -1;
+        }
+
+        int owner_idx = -1;
+        for (int u = 0; u < s->config.n_users; u++) {
+            if (strcmp(s->config.user_names[u], owner) == 0) {
+                owner_idx = u;
+                break;
+            }
+        }
+        if (owner_idx < 0 || s->config.user_keys[owner_idx][0] == '\0') {
+            LOG_E(s, "native route %d: owner '%s' is not a keyed named user", i, owner);
+            return -1;
+        }
+
+        const char *owner_key = s->config.user_keys[owner_idx];
+        if (s->config.auth_key[0] != '\0' && strcmp(owner_key, s->config.auth_key) == 0) {
+            LOG_E(s, "native route owner '%s': key collides with global PSK", owner);
+            return -1;
+        }
+        for (int u = 0; u < s->config.n_users; u++) {
+            if (u != owner_idx && s->config.user_keys[u][0] != '\0' &&
+                strcmp(owner_key, s->config.user_keys[u]) == 0) {
+                LOG_E(s, "native route owner '%s': key also belongs to user '%s'", owner,
+                      s->config.user_names[u]);
+                return -1;
+            }
+        }
+
+        /* A same-length overlap is necessarily an exact duplicate after
+         * canonicalization.  Different owners would make LPM order-dependent. */
+        for (int j = 0; j < i; j++) {
+            const mqvpn_cidr_entry_t *prev = &s->config.route_prefixes[j];
+            if (route->family == prev->family && route->prefix_len == prev->prefix_len &&
+                memcmp(route->net, prev->net, sizeof(route->net)) == 0 &&
+                strcmp(owner, s->config.route_users[j]) != 0) {
+                LOG_E(s, "native route %d: exact prefix has multiple owners", i);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
 
 static void
 svr_log_conn_stats(mqvpn_server_t *s, const char *tag, const xqc_cid_t *cid)
@@ -880,6 +1138,10 @@ svr_conn_free(svr_conn_t *conn)
         mqvpn_reorder_rx_free(conn->reorder_rx);
         conn->reorder_rx = NULL;
     }
+    free(conn->address_request_ids);
+    conn->address_request_ids = NULL;
+    conn->n_address_request_ids = 0;
+    conn->cap_address_request_ids = 0;
     free(conn);
 }
 
@@ -894,6 +1156,10 @@ cb_h3_conn_close(xqc_h3_conn_t *h3_conn, const xqc_cid_t *cid, void *conn_user_d
     svr_log_conn_stats(s, "server conn stats", cid ? cid : &conn->cid);
     LOG_I(s, "server dgram summary: acked=%" PRIu64 " lost=%" PRIu64,
           conn->dgram_acked_cnt, conn->dgram_lost_cnt);
+
+    /* Request-close normally ran first, but connection teardown and engine
+     * error paths are not allowed to leave a cached route target dangling. */
+    svr_routes_unbind_conn(s, conn);
 
     if (conn->assigned_ip.s_addr) {
         uint32_t offset = ntohl(conn->assigned_ip.s_addr) - ntohl(s->pool.base.s_addr);
@@ -986,12 +1252,255 @@ svr_masque_send_501(xqc_h3_request_t *h3_request)
     return xqc_h3_request_send_headers(h3_request, &hdrs, 1) < 0 ? -1 : 0;
 }
 
+typedef struct {
+    uint64_t request_id;
+    uint8_t family;
+} svr_address_response_t;
+
+/* Atomically validate and remember one complete ADDRESS_REQUEST batch.
+ * Returning an error leaves the previous history unchanged. */
+static int
+svr_address_request_ids_record(svr_conn_t *conn,
+                               const svr_address_response_t *responses,
+                               size_t n_responses)
+{
+    if (!conn || (!responses && n_responses != 0)) return -1;
+    if (conn->n_address_request_ids > MAX_ADDRESS_REQUEST_IDS ||
+        n_responses > MAX_ADDRESS_REQUEST_IDS - conn->n_address_request_ids)
+        return -1;
+
+    for (size_t i = 0; i < n_responses; i++) {
+        uint64_t request_id = responses[i].request_id;
+        if (request_id == 0) return -1;
+        for (size_t j = 0; j < conn->n_address_request_ids; j++) {
+            if (conn->address_request_ids[j] == request_id) return -1;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (responses[j].request_id == request_id) return -1;
+        }
+    }
+
+    size_t needed = conn->n_address_request_ids + n_responses;
+    if (needed > conn->cap_address_request_ids) {
+        size_t new_cap = conn->cap_address_request_ids
+                             ? conn->cap_address_request_ids
+                             : 8u;
+        while (new_cap < needed) {
+            if (new_cap > MAX_ADDRESS_REQUEST_IDS / 2u) {
+                new_cap = MAX_ADDRESS_REQUEST_IDS;
+                break;
+            }
+            new_cap *= 2u;
+        }
+        uint64_t *new_ids = realloc(conn->address_request_ids,
+                                    new_cap * sizeof(*new_ids));
+        if (!new_ids) return -1;
+        conn->address_request_ids = new_ids;
+        conn->cap_address_request_ids = new_cap;
+    }
+
+    for (size_t i = 0; i < n_responses; i++)
+        conn->address_request_ids[conn->n_address_request_ids + i] =
+            responses[i].request_id;
+    conn->n_address_request_ids = needed;
+    return 0;
+}
+
+/* Focused hidden hook for the cross-capsule Request-ID invariant.  Production
+ * still exercises the exact helper above; this only supplies two batches
+ * without manufacturing an xquic request object in a unit test. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+int
+mqvpn_server_test_address_request_id_batches(const uint64_t *ids, size_t n_ids,
+                                             size_t split)
+{
+    if ((!ids && n_ids != 0) || split > n_ids ||
+        n_ids > MAX_ADDRESS_REQUEST_IDS + 1u)
+        return -1;
+
+    svr_address_response_t *responses = NULL;
+    if (n_ids != 0) {
+        responses = calloc(n_ids, sizeof(*responses));
+        if (!responses) return -1;
+        for (size_t i = 0; i < n_ids; i++) responses[i].request_id = ids[i];
+    }
+
+    svr_conn_t conn = {0};
+    int rc = svr_address_request_ids_record(&conn, responses, split);
+    if (rc == 0)
+        rc = svr_address_request_ids_record(&conn,
+                                            responses ? responses + split : NULL,
+                                            n_ids - split);
+    free(conn.address_request_ids);
+    free(responses);
+    return rc;
+}
+
+/* Integration-test hook: close the first live CONNECT-IP request through the
+ * public xquic request-close path.  Its close notify must in turn close the H3
+ * connection so normal conn cleanup releases the session/address. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+int
+mqvpn_server_test_close_first_connect_ip(mqvpn_server_t *s)
+{
+    if (!s) return -1;
+    for (int i = 1; i <= MQVPN_ADDR_POOL_MAX; i++) {
+        svr_conn_t *conn = s->sessions[i];
+        if (!conn || !conn->tunnel_established || !conn->connect_ip_request) continue;
+        return xqc_h3_request_close(conn->connect_ip_request) == XQC_OK ? 0 : -1;
+    }
+    return -1;
+}
+
+/* Send the complete ADDRESS_ASSIGN snapshot for this tunnel.
+ *
+ * RFC 9484 section 4.7.1 makes every ADDRESS_ASSIGN capsule a replacement,
+ * not an incremental update.  IPv4 and IPv6 therefore have to share one
+ * capsule: two per-family capsules would make the second one revoke the first.
+ * The primary address of each family precedes that family's routed prefixes so
+ * clients can keep using the first entry as their interface address.  Optional
+ * correlated responses are appended after the authoritative snapshot so a
+ * multi-entry ADDRESS_REQUEST gets one matching response per request without
+ * changing which entry is the primary for either family. */
+static int
+svr_send_address_assign_snapshot(xqc_h3_request_t *h3_request, svr_conn_t *conn,
+                                 const svr_address_response_t *responses,
+                                 size_t n_responses)
+{
+    mqvpn_server_t *s = conn->server;
+    size_t route_count = 0;
+    if (conn->auth_principal[0]) {
+        for (int i = 0; i < s->config.n_routes; i++) {
+            if (strcmp(s->config.route_users[i], conn->auth_principal) == 0)
+                route_count++;
+        }
+    }
+
+    const size_t primary_count = 1u + (conn->has_v6 ? 1u : 0u);
+    if (n_responses > SIZE_MAX - primary_count - route_count) return -1;
+    const size_t entry_count = primary_count + route_count + n_responses;
+    /* Largest entry is request-id(8) + family(1) + IPv6(16) + prefix(1). */
+    if (entry_count > MAX_CAPSULE_BUF / 26u) {
+        LOG_E(s, "ADDRESS_ASSIGN: too many assigned prefixes");
+        return -1;
+    }
+    const size_t payload_cap = entry_count * 26u;
+    if (payload_cap > MAX_CAPSULE_BUF || payload_cap > SIZE_MAX - 16u) return -1;
+    const size_t capsule_cap = payload_cap + 16u; /* two maximum-size QUIC varints */
+
+    uint8_t *payload = malloc(payload_cap);
+    uint8_t *capsule = malloc(capsule_cap);
+    if (!payload || !capsule) {
+        free(payload);
+        free(capsule);
+        LOG_E(s, "ADDRESS_ASSIGN: allocation failed");
+        return -1;
+    }
+
+    size_t off = 0;
+#define APPEND_UNSOLICITED_ADDRESS(family_, addr_, addr_len_, prefix_) \
+    do {                                                               \
+        payload[off++] = 0x00; /* request_id varint 0 */              \
+        payload[off++] = (family_);                                    \
+        memcpy(payload + off, (addr_), (addr_len_));                   \
+        off += (addr_len_);                                            \
+        payload[off++] = (prefix_);                                    \
+    } while (0)
+
+    uint8_t ip4[4];
+    memcpy(ip4, &conn->assigned_ip.s_addr, sizeof(ip4));
+    APPEND_UNSOLICITED_ADDRESS(4, ip4, sizeof(ip4), 32);
+
+    if (conn->has_v6) {
+        /* Legacy compatibility: mqvpn's platform callback derives the
+         * interface prefix from this primary entry, so it still carries the
+         * configured tunnel prefix rather than /128. */
+        APPEND_UNSOLICITED_ADDRESS(6, &conn->assigned_ip6, 16,
+                                   (uint8_t)s->pool.prefix6);
+    }
+
+    if (conn->auth_principal[0]) {
+        for (int i = 0; i < s->config.n_routes; i++) {
+            const mqvpn_cidr_entry_t *route = &s->config.route_prefixes[i];
+            if (strcmp(s->config.route_users[i], conn->auth_principal) != 0)
+                continue;
+            APPEND_UNSOLICITED_ADDRESS(route->family, route->net,
+                                       route->family == 4 ? 4u : 16u,
+                                       route->prefix_len);
+        }
+    }
+
+    for (size_t i = 0; i < n_responses; i++) {
+        const svr_address_response_t *response = &responses[i];
+        const uint8_t zero6[16] = {0};
+        const uint8_t *addr = ip4;
+        uint8_t family = response->family;
+        uint8_t prefix = 32;
+        if (family == 6) {
+            if (conn->has_v6) {
+                /* Match the legacy primary tuple exactly.  Sending the same
+                 * host once with its interface prefix and again as /128 would
+                 * be a contradictory primary replay at the receiver. */
+                addr = (const uint8_t *)&conn->assigned_ip6;
+                prefix = (uint8_t)s->pool.prefix6;
+            } else {
+                /* RFC 9484's explicit address-request rejection. */
+                addr = zero6;
+                prefix = 128;
+            }
+        }
+        size_t written = 0;
+        if (response->request_id == 0 || (family != 4 && family != 6) ||
+            xqc_h3_ext_connectip_build_address_request(
+                payload + off, payload_cap - off, &written, response->request_id,
+                family, addr, prefix) != XQC_OK) {
+            free(payload);
+            free(capsule);
+            return -1;
+        }
+        off += written;
+    }
+#undef APPEND_UNSOLICITED_ADDRESS
+    assert(off <= payload_cap);
+
+    size_t capsule_len = 0;
+    xqc_int_t xret = xqc_h3_ext_capsule_encode(
+        capsule, capsule_cap, &capsule_len, XQC_H3_CAPSULE_ADDRESS_ASSIGN, payload,
+        off);
+    free(payload);
+    if (xret != XQC_OK) {
+        LOG_E(s, "capsule encode ADDRESS_ASSIGN snapshot: %d", xret);
+        free(capsule);
+        return -1;
+    }
+
+    size_t sent_total = 0;
+    while (sent_total < capsule_len) {
+        ssize_t sent = xqc_h3_request_send_body(h3_request, capsule + sent_total,
+                                                capsule_len - sent_total, 0);
+        if (sent <= 0) {
+            LOG_E(s, "send ADDRESS_ASSIGN snapshot: %zd", sent);
+            free(capsule);
+            return -1;
+        }
+        sent_total += (size_t)sent;
+    }
+    free(capsule);
+    return 0;
+}
+
 static int
 svr_masque_send_response(xqc_h3_request_t *h3_request, svr_stream_t *stream)
 {
     svr_conn_t *conn = stream->conn;
     mqvpn_server_t *s = conn->server;
     ssize_t ret;
+    xqc_int_t xret;
+    int ip_needs_release = 0;
 
     if (s->n_sessions >= s->max_clients) {
         LOG_W(s, "max clients reached (%d), rejecting", s->max_clients);
@@ -1003,6 +1512,25 @@ svr_masque_send_response(xqc_h3_request_t *h3_request, svr_stream_t *stream)
          * stream's clean 403 — see svr_masque_send_403's doc comment. */
         stream->role = SVR_STREAM_ROLE_REJECTED;
         return 0;
+    }
+
+    /* Pinned addresses are pre-reserved rather than allocated per connect.
+     * Without this guard, a second connection for the same user would
+     * overwrite sessions[offset] and increment n_sessions twice. */
+    if (conn->auth_principal[0]) {
+        for (int i = 0; i < s->n_pinned_ips; i++) {
+            if (strcmp(s->pinned_ips[i].username, conn->auth_principal) != 0) continue;
+            uint32_t off = s->pinned_ips[i].offset;
+            if (off <= MQVPN_ADDR_POOL_MAX && s->sessions[off] &&
+                s->sessions[off] != conn) {
+                LOG_W(s, "rejecting CONNECT-IP: pinned user '%s' is already connected",
+                      conn->auth_principal);
+                svr_masque_send_403(h3_request);
+                stream->role = SVR_STREAM_ROLE_REJECTED;
+                return 0;
+            }
+            break;
+        }
     }
 
     /* 1. Send 200 response headers */
@@ -1045,9 +1573,9 @@ svr_masque_send_response(xqc_h3_request_t *h3_request, svr_stream_t *stream)
     /* 2. Allocate client IP */
 
     /* 2a. Fixed (pinned) IP for this user — already reserved in pool */
-    if (conn->username[0]) {
+    if (conn->auth_principal[0]) {
         for (int i = 0; i < s->n_pinned_ips; i++) {
-            if (strcmp(s->pinned_ips[i].username, conn->username) != 0) continue;
+            if (strcmp(s->pinned_ips[i].username, conn->auth_principal) != 0) continue;
             conn->assigned_ip = s->pinned_ips[i].ip;
             char ip_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &conn->assigned_ip, ip_str, sizeof(ip_str));
@@ -1063,6 +1591,7 @@ svr_masque_send_response(xqc_h3_request_t *h3_request, svr_stream_t *stream)
             if (strcmp(s->leases[i].username, conn->username) != 0) continue;
             if (mqvpn_addr_pool_alloc_at(&s->pool, s->leases[i].offset,
                                          &conn->assigned_ip) == 0) {
+                ip_needs_release = 1;
                 char ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &conn->assigned_ip, ip_str, sizeof(ip_str));
                 LOG_I(s, "restored leased IP %s for user '%s'",
@@ -1077,76 +1606,25 @@ svr_masque_send_response(xqc_h3_request_t *h3_request, svr_stream_t *stream)
         LOG_E(s, "IP pool exhausted");
         return -1;
     }
+    ip_needs_release = 1;
 ip_assigned:;
 
-    /* 3. ADDRESS_ASSIGN capsule */
-    uint8_t addr_payload[64];
-    uint8_t ip_bytes[4];
-    memcpy(ip_bytes, &conn->assigned_ip.s_addr, 4);
-    addr_payload[0] = 0x00; /* request_id=0 */
-    addr_payload[1] = 4;    /* IPv4 */
-    memcpy(addr_payload + 2, ip_bytes, 4);
-    addr_payload[6] = 32; /* /32 */
-    size_t addr_written = 7;
+    /* 3. Materialize both primary families before emitting the one complete
+     * ADDRESS_ASSIGN snapshot required by RFC 9484 section 4.7.1. */
+    if (s->pool.has_v6) {
+        uint32_t ip_offset = ntohl(conn->assigned_ip.s_addr) - ntohl(s->pool.base.s_addr);
+        mqvpn_addr_pool_get6(&s->pool, ip_offset, &conn->assigned_ip6);
+        conn->has_v6 = 1;
+    }
 
-    uint8_t capsule_buf[128];
-    size_t cap_written = 0;
-    xqc_int_t xret = xqc_h3_ext_capsule_encode(
-        capsule_buf, sizeof(capsule_buf), &cap_written, XQC_H3_CAPSULE_ADDRESS_ASSIGN,
-        addr_payload, addr_written);
-    if (xret != XQC_OK) {
-        LOG_E(s, "capsule encode ADDRESS_ASSIGN: %d", xret);
+    if (svr_send_address_assign_snapshot(h3_request, conn, NULL, 0) != 0)
         goto fail_release_ip;
-    }
-    ret = xqc_h3_request_send_body(h3_request, capsule_buf, cap_written, 0);
-    if (ret < 0) {
-        LOG_E(s, "send ADDRESS_ASSIGN: %zd", ret);
-        goto fail_release_ip;
-    }
 
     char ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &conn->assigned_ip, ip_str, sizeof(ip_str));
     LOG_I(s, "ADDRESS_ASSIGN: client=%s/32", ip_str);
 
-    /* 3b. IPv6 ADDRESS_ASSIGN
-     *
-     * Treat encode/send failure as fatal (matching IPv4 above): a send_body
-     * failure here means the same H3 stream that just succeeded for v4 is
-     * now broken, so "fall back to v4-only" isn't reachable — the next
-     * ROUTE_ADV v4 send would also fail. has_v6 is assigned only AFTER the
-     * capsule is successfully sent so fail_release_ip doesn't have to
-     * reason about half-set v6 state. */
-    if (s->pool.has_v6) {
-        struct in6_addr v6;
-        uint32_t ip_offset = ntohl(conn->assigned_ip.s_addr) - ntohl(s->pool.base.s_addr);
-        mqvpn_addr_pool_get6(&s->pool, ip_offset, &v6);
-
-        uint8_t a6_payload[32];
-        size_t a6_off = 0;
-        a6_payload[a6_off++] = 0x00;
-        a6_payload[a6_off++] = 6;
-        memcpy(a6_payload + a6_off, &v6, 16);
-        a6_off += 16;
-        a6_payload[a6_off++] = (uint8_t)s->pool.prefix6;
-
-        uint8_t cap6_buf[64];
-        size_t cap6_written = 0;
-        xret =
-            xqc_h3_ext_capsule_encode(cap6_buf, sizeof(cap6_buf), &cap6_written,
-                                      XQC_H3_CAPSULE_ADDRESS_ASSIGN, a6_payload, a6_off);
-        if (xret != XQC_OK) {
-            LOG_E(s, "capsule encode ADDRESS_ASSIGN (IPv6): %d", xret);
-            goto fail_release_ip;
-        }
-        ret = xqc_h3_request_send_body(h3_request, cap6_buf, cap6_written, 0);
-        if (ret < 0) {
-            LOG_E(s, "send ADDRESS_ASSIGN (IPv6): %zd", ret);
-            goto fail_release_ip;
-        }
-
-        conn->assigned_ip6 = v6;
-        conn->has_v6 = 1;
-
+    if (conn->has_v6) {
         char v6str[INET6_ADDRSTRLEN];
         inet_ntop(AF_INET6, &conn->assigned_ip6, v6str, sizeof(v6str));
         LOG_I(s, "ADDRESS_ASSIGN: client=%s/%d", v6str, s->pool.prefix6);
@@ -1172,7 +1650,7 @@ ip_assigned:;
         goto fail_release_ip;
     }
     ret = xqc_h3_request_send_body(h3_request, route_capsule, rc_written, 0);
-    if (ret < 0) {
+    if (ret != (ssize_t)rc_written) {
         LOG_E(s, "send ROUTE_ADVERTISEMENT: %zd", ret);
         goto fail_release_ip;
     }
@@ -1199,20 +1677,24 @@ ip_assigned:;
             goto fail_release_ip;
         }
         ret = xqc_h3_request_send_body(h3_request, r6_capsule, r6c_written, 0);
-        if (ret < 0) {
+        if (ret != (ssize_t)r6c_written) {
             LOG_E(s, "send ROUTE_ADVERTISEMENT (IPv6): %zd", ret);
             goto fail_release_ip;
         }
     }
 
-    conn->tunnel_established = 1;
-
     /* Register in session table */
     uint32_t ip_off = ntohl(conn->assigned_ip.s_addr) - ntohl(s->pool.base.s_addr);
-    if (ip_off > 0 && ip_off <= MQVPN_ADDR_POOL_MAX) {
-        s->sessions[ip_off] = conn;
-        s->n_sessions++;
+    if (ip_off == 0 || ip_off > MQVPN_ADDR_POOL_MAX ||
+        (s->sessions[ip_off] && s->sessions[ip_off] != conn)) {
+        LOG_E(s, "cannot register CONNECT-IP session at offset %u", ip_off);
+        goto fail_release_ip;
     }
+    s->sessions[ip_off] = conn;
+    s->n_sessions++;
+    conn->tunnel_established = 1;
+    /* Bind only after the exact-IP session registration is complete. */
+    svr_routes_bind_conn(s, conn);
     LOG_I(s, "MASQUE tunnel established (stream_id=%" PRIu64 ", clients=%d)",
           conn->masque_stream_id, s->n_sessions);
 
@@ -1252,7 +1734,10 @@ ip_assigned:;
     return 0;
 
 fail_release_ip:
-    mqvpn_addr_pool_release(&s->pool, &conn->assigned_ip);
+    /* Pinned addresses were reserved during server construction and must stay
+     * unavailable to the dynamic pool even when a post-200 capsule send
+     * fails.  Only allocations performed for this attempt are rolled back. */
+    if (ip_needs_release) mqvpn_addr_pool_release(&s->pool, &conn->assigned_ip);
     memset(&conn->assigned_ip, 0, sizeof(conn->assigned_ip));
     /* Always 0/zero on the goto paths today; reset for safety against
      * future edits that move the assignments above. */
@@ -1284,8 +1769,10 @@ cb_request_create(xqc_h3_request_t *h3_request, void *strm_user_data)
 static int
 cb_request_close(xqc_h3_request_t *h3_request, void *strm_user_data)
 {
-    (void)h3_request;
     svr_stream_t *stream = (svr_stream_t *)strm_user_data;
+    mqvpn_server_t *close_server = NULL;
+    xqc_cid_t close_cid = {0};
+    int close_tunnel_conn = 0;
     if (stream) {
         /* Only the CONNECT-IP tunnel stream owns tunnel_established — a
          * closing non-tunnel stream (per-flow connect-tcp, or a 501'd
@@ -1301,7 +1788,26 @@ cb_request_close(xqc_h3_request_t *h3_request, void *strm_user_data)
          * 0 for a rejected stream (never set on the reject path), so
          * clearing it again here is a no-op. */
         if (stream->conn && (stream->role == SVR_STREAM_ROLE_CONNECT_IP ||
-                             stream->role == SVR_STREAM_ROLE_REJECTED)) {
+                             stream->role == SVR_STREAM_ROLE_REJECTED) &&
+            stream->conn->connect_ip_request == h3_request) {
+            /* A real CONNECT-IP stream is the lifetime anchor for the whole
+             * tunnel.  If it closes independently of its H3 connection, the
+             * conn-close callback would otherwise never release sessions[],
+             * n_sessions, or the address allocation.  Rejected attempts have
+             * no assigned address and intentionally keep the H3 connection
+             * available for another request.  Copy everything needed before
+             * freeing stream; the close call is made only after that free. */
+            if (!stream->conn->server->shutting_down &&
+                stream->role == SVR_STREAM_ROLE_CONNECT_IP &&
+                stream->conn->assigned_ip.s_addr != 0) {
+                close_server = stream->conn->server;
+                close_cid = stream->conn->cid;
+                close_tunnel_conn = 1;
+            }
+            /* Only the request which actually owns this connection's tunnel
+             * may tear it down.  In particular, closing a rejected second
+             * CONNECT-IP stream must not disable the established first one. */
+            svr_routes_unbind_conn(stream->conn->server, stream->conn);
             stream->conn->tunnel_established = 0;
             stream->conn->connect_ip_request = NULL;
         }
@@ -1323,6 +1829,12 @@ cb_request_close(xqc_h3_request_t *h3_request, void *strm_user_data)
 #endif
         free(stream->capsule_buf);
         free(stream);
+    }
+
+    if (close_tunnel_conn) {
+        xqc_int_t ret = xqc_h3_conn_close(close_server->engine, &close_cid);
+        if (ret != XQC_OK && ret != -XQC_ECONN_NFOUND)
+            LOG_W(close_server, "CONNECT-IP request-close H3 close failed: %d", ret);
     }
     return 0;
 }
@@ -1494,13 +2006,42 @@ svr_connect_ip_on_request(mqvpn_server_t *s, svr_stream_t *stream,
         }
 
         stream->conn->connected_at_us = now_us();
-        if (strcmp(username, "(global)") == 0 && hdrs->x_user[0] != '\0')
+        /* A previous, failed CONNECT-IP attempt on this H3 connection may
+         * have authenticated before response construction failed.  Rebuild
+         * both identities from this request instead of inheriting either. */
+        stream->conn->username[0] = '\0';
+        stream->conn->auth_principal[0] = '\0';
+        if (strcmp(username, "(global)") == 0) {
+            /* x-user is display/lease metadata supplied by a holder of the
+             * global key, never an authorization principal.  This remains
+             * true even when x-user is absent: "(global)" is a label, not a
+             * named-user identity that can own native routes. */
             snprintf(stream->conn->username, sizeof(stream->conn->username), "%s",
-                     hdrs->x_user);
-        else
+                     hdrs->x_user[0] != '\0' ? hdrs->x_user : "(global)");
+        } else {
             snprintf(stream->conn->username, sizeof(stream->conn->username), "%s", username);
+            /* The connection is calloc'd and a second CONNECT-IP request is
+             * rejected before this handler, so this assignment is immutable
+             * for the connection lifetime. */
+            snprintf(stream->conn->auth_principal,
+                     sizeof(stream->conn->auth_principal), "%s", username);
+        }
 
-        LOG_I(s, "client authenticated successfully (user=%s)", stream->conn->username);
+        LOG_I(s, "client authenticated successfully (user=%s principal=%s)",
+              stream->conn->username,
+              stream->conn->auth_principal[0] ? stream->conn->auth_principal : "(none)");
+    }
+
+    /* Route ownership is single-session by design.  Reject before address
+     * allocation and before a 200 response so route_targets[] can never be
+     * ambiguous and an established owner is not silently replaced. */
+    if (svr_principal_has_routes(s, stream->conn->auth_principal) &&
+        svr_routed_principal_busy(s, stream->conn->auth_principal, stream->conn)) {
+        LOG_W(s, "rejecting CONNECT-IP: routed principal '%s' is already connected",
+              stream->conn->auth_principal);
+        svr_masque_send_403(h3_request);
+        stream->role = SVR_STREAM_ROLE_REJECTED;
+        return 0;
     }
 
     LOG_I(s, "Extended CONNECT for connect-ip received");
@@ -1751,6 +2292,32 @@ svr_path_policy_find(mqvpn_server_t *s, const char *username, const char *iface)
     return -1;
 }
 
+/* A capsule framing/allocation error invalidates the CONNECT-IP tunnel
+ * immediately, before xquic's asynchronous request-close callback clears the
+ * rest of the session bookkeeping. */
+static int
+svr_connect_ip_protocol_error(mqvpn_server_t *s, svr_stream_t *stream,
+                              xqc_h3_request_t *h3_request)
+{
+    (void)h3_request;
+    if (stream && stream->conn) {
+        svr_routes_unbind_conn(s, stream->conn);
+        stream->conn->tunnel_established = 0;
+
+        /* The session table and address-pool allocation are owned by the H3
+         * connection close callback.  Closing only this request can leave a
+         * live H3 connection behind indefinitely, retaining sessions[] and
+         * n_sessions after a malformed capsule.  Explicitly close the owning
+         * connection before the request: xqc_h3_conn_close only transitions
+         * it to CLOSING/queues engine work, so it does not synchronously free
+         * stream->conn while this read callback is on the stack. */
+        xqc_int_t ret = xqc_h3_conn_close(s->engine, &stream->conn->cid);
+        if (ret != XQC_OK && ret != -XQC_ECONN_NFOUND)
+            LOG_W(s, "CONNECT-IP protocol-error H3 close failed: %d", ret);
+    }
+    return -1;
+}
+
 /* CONNECT-IP stream body: capsule reassembly + ADDRESS_REQUEST/PATH_LABEL
  * handling. */
 static int
@@ -1762,13 +2329,19 @@ svr_connect_ip_on_body(mqvpn_server_t *s, svr_stream_t *stream,
     ssize_t n;
     do {
         n = xqc_h3_request_recv_body(h3_request, buf, sizeof(buf), &fin);
-        if (n <= 0) break;
-
-        size_t need = stream->capsule_len + (size_t)n;
-        if (need > MAX_CAPSULE_BUF) {
-            LOG_E(s, "server capsule buffer overflow");
-            break;
+        if (n == -XQC_EAGAIN) break;
+        if (n < 0) {
+            LOG_E(s, "CONNECT-IP body receive failed: %zd", n);
+            return svr_connect_ip_protocol_error(s, stream, h3_request);
         }
+        if (n == 0) break;
+
+        if (stream->capsule_len > MAX_CAPSULE_BUF ||
+            (size_t)n > MAX_CAPSULE_BUF - stream->capsule_len) {
+            LOG_E(s, "server capsule buffer overflow");
+            return svr_connect_ip_protocol_error(s, stream, h3_request);
+        }
+        size_t need = stream->capsule_len + (size_t)n;
         if (need > stream->capsule_cap) {
             size_t new_cap = stream->capsule_cap ? stream->capsule_cap * 2 : 4096;
             while (new_cap < need) {
@@ -1779,7 +2352,10 @@ svr_connect_ip_on_body(mqvpn_server_t *s, svr_stream_t *stream,
                 new_cap *= 2;
             }
             uint8_t *nb = realloc(stream->capsule_buf, new_cap);
-            if (!nb) break;
+            if (!nb) {
+                LOG_E(s, "server capsule buffer allocation failed");
+                return svr_connect_ip_protocol_error(s, stream, h3_request);
+            }
             stream->capsule_buf = nb;
             stream->capsule_cap = new_cap;
         }
@@ -1797,28 +2373,59 @@ svr_connect_ip_on_body(mqvpn_server_t *s, svr_stream_t *stream,
 
             if (cap_type == XQC_H3_CAPSULE_ADDRESS_REQUEST && stream->conn &&
                 stream->conn->tunnel_established) {
-                uint64_t req_id;
-                uint8_t ip_ver, ip_addr[16], prefix;
-                size_t ip_len = 16, aa_consumed;
-                xr = xqc_h3_ext_connectip_parse_address_assign(
-                    cap_payload, cap_len, &req_id, &ip_ver, ip_addr, &ip_len, &prefix,
-                    &aa_consumed);
-                if (xr == XQC_OK && req_id != 0) {
-                    LOG_I(s, "ADDRESS_REQUEST: req_id=%" PRIu64 " ipv%d", req_id, ip_ver);
-                    uint8_t resp_payload[64];
-                    size_t resp_written = 0;
-                    uint8_t resp_ip[4];
-                    memcpy(resp_ip, &stream->conn->assigned_ip.s_addr, 4);
-                    xqc_h3_ext_connectip_build_address_request(
-                        resp_payload, sizeof(resp_payload), &resp_written, req_id, 4,
-                        resp_ip, 32);
-                    uint8_t cap_buf[128];
-                    size_t cap_w = 0;
-                    xqc_h3_ext_capsule_encode(cap_buf, sizeof(cap_buf), &cap_w,
-                                              XQC_H3_CAPSULE_ADDRESS_ASSIGN, resp_payload,
-                                              resp_written);
-                    xqc_h3_request_send_body(h3_request, cap_buf, cap_w, 0);
+                /* RFC 9484 §4.7.2 requires one or more well-formed, nonzero,
+                 * unique request ids and one matching response per entry. */
+                svr_address_response_t responses[MQVPN_MAX_ROUTES + 2];
+                size_t n_responses = 0;
+                size_t request_off = 0;
+                while (request_off < cap_len) {
+                    uint64_t req_id;
+                    uint8_t ip_ver, ip_addr[16], prefix;
+                    size_t ip_len = sizeof(ip_addr), aa_consumed = 0;
+                    xr = xqc_h3_ext_connectip_parse_address_assign(
+                        cap_payload + request_off, cap_len - request_off, &req_id,
+                        &ip_ver, ip_addr, &ip_len, &prefix, &aa_consumed);
+                    if (xr != XQC_OK || aa_consumed == 0 || req_id == 0 ||
+                        prefix > (ip_ver == 4 ? 32u : 128u) ||
+                        n_responses >= sizeof(responses) / sizeof(responses[0])) {
+                        LOG_E(s, "malformed ADDRESS_REQUEST capsule");
+                        return svr_connect_ip_protocol_error(s, stream, h3_request);
+                    }
+                    mqvpn_cidr_entry_t requested = {0};
+                    requested.family = ip_ver;
+                    requested.prefix_len = prefix;
+                    memcpy(requested.net, ip_addr, ip_len);
+                    mqvpn_cidr_entry_t canonical = requested;
+                    mqvpn_cidr_premask(canonical.net, canonical.prefix_len);
+                    if (memcmp(canonical.net, requested.net,
+                               sizeof(requested.net)) != 0) {
+                        LOG_E(s, "non-canonical ADDRESS_REQUEST prefix");
+                        return svr_connect_ip_protocol_error(s, stream, h3_request);
+                    }
+                    responses[n_responses++] =
+                        (svr_address_response_t){.request_id = req_id,
+                                                 .family = ip_ver};
+                    LOG_I(s, "ADDRESS_REQUEST: req_id=%" PRIu64 " ipv%d", req_id,
+                          ip_ver);
+                    request_off += aa_consumed;
                 }
+                if (n_responses == 0 || request_off != cap_len) {
+                    LOG_E(s, "empty/trailing ADDRESS_REQUEST capsule");
+                    return svr_connect_ip_protocol_error(s, stream, h3_request);
+                }
+
+                if (svr_address_request_ids_record(stream->conn, responses,
+                                                   n_responses) != 0) {
+                    LOG_E(s, "reused/excess ADDRESS_REQUEST id history");
+                    return svr_connect_ip_protocol_error(s, stream, h3_request);
+                }
+
+                /* ADDRESS_ASSIGN is a full replacement snapshot.  Include
+                 * every primary/route plus correlated responses in one
+                 * capsule so answering a request never revokes policy. */
+                if (svr_send_address_assign_snapshot(h3_request, stream->conn,
+                                                     responses, n_responses) != 0)
+                    return svr_connect_ip_protocol_error(s, stream, h3_request);
             }
 
             if (cap_type == MQVPN_CAPSULE_PATH_LABEL && stream->conn) {
@@ -1861,7 +2468,12 @@ svr_connect_ip_on_body(mqvpn_server_t *s, svr_stream_t *stream,
                          * intentional later override on the next path
                          * flap/reconnect within the same connection. */
                         if (is_new_label) {
-                            int pi = svr_path_policy_find(s, stream->conn->username, iface);
+                            /* Persisted per-user policy is authorization state,
+                             * not display metadata.  A global-PSK holder can
+                             * choose x-user/username, so only the credential-
+                             * derived principal may select a named policy. */
+                            int pi = svr_path_policy_find(
+                                s, stream->conn->auth_principal, iface);
                             if (pi >= 0) {
                                 if (s->config.path_policy_has_weight[pi]) {
                                     label->weight = s->config.path_policy_weight[pi];
@@ -1933,7 +2545,16 @@ svr_connect_ip_on_body(mqvpn_server_t *s, svr_stream_t *stream,
                         stream->capsule_len - consumed);
             stream->capsule_len -= consumed;
         }
-    } while (1);
+    } while (!fin);
+
+    /* READ_EMPTY_FIN is delivered separately by xquic.  A FIN after an
+     * incomplete capsule is a wire error; without this check the partial bytes
+     * survived forever on an otherwise live, authorized tunnel. */
+    if (fin && stream->capsule_len != 0) {
+        LOG_E(s, "CONNECT-IP body ended with an incomplete capsule (%zu bytes)",
+              stream->capsule_len);
+        return svr_connect_ip_protocol_error(s, stream, h3_request);
+    }
 
     return 0;
 }
@@ -1960,9 +2581,24 @@ cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag,
         svr_parse_request_headers(s, stream, headers, &hdrs);
 
         if (hdrs.is_connect && hdrs.is_connect_ip) {
+            /* A svr_conn_t owns exactly one CONNECT-IP stream.  Besides being
+             * the protocol's tunnel identity, masque_stream_id/assigned_ip are
+             * connection-wide fields; allowing a second stream would leave an
+             * old sessions[] slot pointing at a later-freed conn. */
+            if ((stream->conn->connect_ip_request &&
+                 stream->conn->connect_ip_request != h3_request) ||
+                stream->conn->assigned_ip.s_addr != 0) {
+                /* assigned_ip stays set until H3 teardown after a tunnel has
+                 * ever registered.  Rejecting on it also covers a second
+                 * stream opened after the first request closed; otherwise a
+                 * second sessions[] slot could outlive this one conn object. */
+                LOG_W(s, "rejecting repeated CONNECT-IP stream on one H3 connection");
+                stream->role = SVR_STREAM_ROLE_REJECTED;
+                svr_masque_send_403(h3_request);
+                return 0;
+            }
             /* Role is tagged even though the handler may still fail with -1
-             * (stream reset); harmless — a reset stream's role is never
-             * consulted again. */
+             * (stream reset); close cleanup below is pointer-guarded. */
             stream->role = SVR_STREAM_ROLE_CONNECT_IP;
             stream->conn->connect_ip_request = h3_request;
             return svr_connect_ip_on_request(s, stream, h3_request, &hdrs);
@@ -2009,7 +2645,9 @@ cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag,
     }
 #endif
 
-    if (flag & XQC_REQ_NOTIFY_READ_BODY) {
+    /* Empty FIN is a standalone notify in xquic.  CONNECT-IP must see it so
+     * svr_connect_ip_on_body can reject a buffered partial capsule. */
+    if (flag & (XQC_REQ_NOTIFY_READ_BODY | XQC_REQ_NOTIFY_READ_EMPTY_FIN)) {
         switch (stream->role) {
         case SVR_STREAM_ROLE_CONNECT_IP:
             return svr_connect_ip_on_body(s, stream, h3_request);
@@ -2091,6 +2729,39 @@ cb_request_closing_notify(xqc_h3_request_t *h3_request, xqc_int_t err,
  *  Datagram callbacks
  * ================================================================ */
 
+/* Validate a bare inner packet's source against this authenticated session.
+ * Exact tunnel addresses keep their existing fast rule.  A different address
+ * inside either tunnel pool is always forbidden; outside the pool, the global
+ * LPM owner (not merely any covering row for this user) must equal the
+ * immutable per-user auth principal. */
+static int
+svr_inner_source_authorized(const svr_conn_t *conn, const uint8_t *pkt, size_t len)
+{
+    if (!conn || !pkt || len < 1) return 0;
+    const mqvpn_server_t *s = conn->server;
+    uint8_t family = pkt[0] >> 4;
+    uint8_t source[16] = {0};
+
+    if (family == 4) {
+        if (len < 20) return 0;
+        memcpy(source, pkt + 12, 4);
+        if (memcmp(source, &conn->assigned_ip.s_addr, 4) == 0) return 1;
+    } else if (family == 6) {
+        if (len < 40) return 0;
+        memcpy(source, pkt + 8, 16);
+        if (conn->has_v6 && memcmp(source, &conn->assigned_ip6, 16) == 0) return 1;
+    } else {
+        return 0;
+    }
+
+    if (svr_addr_in_tunnel_pool(s, family, source)) return 0;
+    if (conn->auth_principal[0] == '\0') return 0;
+
+    int route_idx = svr_route_lpm(s, family, source);
+    return route_idx >= 0 &&
+           strcmp(s->config.route_users[route_idx], conn->auth_principal) == 0;
+}
+
 /*
  * forward_inner_ip — post-process one de-stamped inner IP packet received from a
  * client and hand it to TUN. Shared by the RAW dispatch in cb_dgram_read AND the
@@ -2114,7 +2785,7 @@ forward_inner_ip(svr_conn_t *conn, const uint8_t *pkt, size_t len)
 
     if (ip_ver == 4) {
         if (len < 20) return;
-        if (memcmp(pkt + 12, &conn->assigned_ip.s_addr, 4) != 0) {
+        if (!svr_inner_source_authorized(conn, pkt, len)) {
             LOG_W(s, "dropping packet: src IP mismatch");
             return;
         }
@@ -2136,7 +2807,7 @@ forward_inner_ip(svr_conn_t *conn, const uint8_t *pkt, size_t len)
         fwd_pkt[11] = sum & 0xFF;
     } else if (ip_ver == 6) {
         if (len < 40) return;
-        if (!conn->has_v6 || memcmp(pkt + 8, &conn->assigned_ip6, 16) != 0) {
+        if (!svr_inner_source_authorized(conn, pkt, len)) {
             LOG_W(s, "dropping IPv6 packet: src IP mismatch");
             return;
         }
@@ -2192,6 +2863,15 @@ cb_dgram_read(xqc_h3_conn_t *h3_conn, const void *data, size_t data_len, void *u
     switch (mqvpn_reorder_classify_byte(payload[0])) {
     case MQVPN_REORDER_KIND_RAW: forward_inner_ip(conn, payload, payload_len); return;
     case MQVPN_REORDER_KIND_REORDER_V1:
+        /* Reject spoofed sources before they can allocate/update reorder flow
+         * state.  forward_inner_ip checks again when the packet is eventually
+         * delivered, preserving the invariant across buffered delivery. */
+        if (payload_len <= MQVPN_REORDER_HDR_LEN ||
+            !svr_inner_source_authorized(conn, payload + MQVPN_REORDER_HDR_LEN,
+                                         payload_len - MQVPN_REORDER_HDR_LEN)) {
+            LOG_W(s, "dropping reorder packet: src IP mismatch");
+            return;
+        }
         if (conn->reorder_rx) {
             mqvpn_reorder_rx_on_packet(conn->reorder_rx, payload, payload_len, now_us());
         } else {
@@ -2351,6 +3031,7 @@ mqvpn_server_new(const mqvpn_config_t *cfg, const mqvpn_server_callbacks_t *cbs,
             goto cleanup;
         }
     }
+    if (svr_routes_validate(s) != 0) goto cleanup;
 
     /* Pre-reserve fixed IPs for users that have one configured */
     for (int i = 0; i < s->config.n_users; i++) {
@@ -2635,6 +3316,7 @@ mqvpn_server_destroy(mqvpn_server_t *s)
 
     /* Step 1: xqc_engine_destroy triggers h3_conn_close → session free */
     if (s->engine) {
+        s->shutting_down = 1;
         xqc_h3_ctx_destroy(s->engine);
         xqc_engine_destroy(s->engine);
         s->engine = NULL;
@@ -2659,6 +3341,7 @@ mqvpn_server_destroy(mqvpn_server_t *s)
      * callback that would normally free them did not fire for these conns). */
     for (int i = 1; i <= MQVPN_ADDR_POOL_MAX; i++) {
         if (s->sessions[i]) {
+            svr_routes_unbind_conn(s, s->sessions[i]);
             svr_conn_free(s->sessions[i]);
             s->sessions[i] = NULL;
         }
@@ -2780,26 +3463,54 @@ mqvpn_server_on_tun_packet(mqvpn_server_t *s, const uint8_t *pkt, size_t len)
     if (!s || !pkt || len == 0) return MQVPN_ERR_INVALID_ARG;
     ASSERT_TICK_THREAD(s);
 
-    if (s->n_sessions == 0) return MQVPN_OK;
     if (s->tun_paused) return MQVPN_ERR_AGAIN;
     uint8_t ip_ver = pkt[0] >> 4;
     svr_conn_t *target = NULL;
+    int route_idx = -1;
 
     if (ip_ver == 4 && len >= 20) {
-        struct in_addr dst_ip;
-        memcpy(&dst_ip.s_addr, pkt + 16, 4);
-        uint32_t offset = ntohl(dst_ip.s_addr) - ntohl(s->pool.base.s_addr);
-        if (offset == 0 || offset > MQVPN_ADDR_POOL_MAX) return MQVPN_OK;
-        target = s->sessions[offset];
-    } else if (ip_ver == 6 && len >= 40 && s->pool.has_v6) {
-        struct in6_addr dst_ip6;
-        memcpy(&dst_ip6, pkt + 24, 16);
-        uint32_t offset = mqvpn_addr_pool_offset6(&s->pool, &dst_ip6);
-        if (offset == 0 || offset > MQVPN_ADDR_POOL_MAX) return MQVPN_OK;
-        target = s->sessions[offset];
+        uint8_t dst[16] = {0};
+        memcpy(dst, pkt + 16, 4);
+        if (svr_addr_in_tunnel_pool(s, 4, dst)) {
+            /* Tunnel-pool destinations never fall through to native routes,
+             * even when the exact address is currently unassigned. */
+            struct in_addr dst_ip;
+            memcpy(&dst_ip.s_addr, dst, 4);
+            uint32_t dst_h = ntohl(dst_ip.s_addr);
+            uint32_t base_h = ntohl(s->pool.base.s_addr);
+            if (dst_h >= base_h) {
+                uint32_t offset = dst_h - base_h;
+                if (offset > 0 && offset <= MQVPN_ADDR_POOL_MAX)
+                    target = s->sessions[offset];
+            }
+        } else {
+            route_idx = svr_route_lpm(s, 4, dst);
+            if (route_idx < 0) return MQVPN_OK;
+            target = s->route_targets[route_idx];
+        }
+    } else if (ip_ver == 6 && len >= 40) {
+        uint8_t dst[16];
+        memcpy(dst, pkt + 24, 16);
+        if (svr_addr_in_tunnel_pool(s, 6, dst)) {
+            struct in6_addr dst_ip6;
+            memcpy(&dst_ip6, dst, 16);
+            uint32_t offset = mqvpn_addr_pool_offset6(&s->pool, &dst_ip6);
+            if (offset > 0 && offset <= MQVPN_ADDR_POOL_MAX)
+                target = s->sessions[offset];
+        } else {
+            route_idx = svr_route_lpm(s, 6, dst);
+            if (route_idx < 0) return MQVPN_OK;
+            target = s->route_targets[route_idx];
+        }
     } else {
         return MQVPN_OK;
     }
+
+    /* Preserve the historical no-session fast path for ordinary tunnel-pool
+     * misses.  Configured native routes are different: an offline LPM winner
+     * must still produce the existing ICMP-unreachable signal and must never
+     * fall through to a less-specific owner. */
+    if (!target && route_idx < 0 && s->n_sessions == 0) return MQVPN_OK;
 
     if (!target || !target->tunnel_established) {
         /* §7.3: ICMP Dest Unreachable for unknown destination (rate limited) */
@@ -2820,6 +3531,9 @@ mqvpn_server_on_tun_packet(mqvpn_server_t *s, const uint8_t *pkt, size_t len)
                 LOG_D(s, "sent ICMPv6 Dest Unreachable to TUN");
             }
         }
+        if (route_idx >= 0)
+            LOG_D(s, "native route owner '%s' is offline",
+                  s->config.route_users[route_idx]);
         return MQVPN_OK;
     }
 
@@ -3231,11 +3945,31 @@ mqvpn_server_add_user(mqvpn_server_t *s, const char *username, const char *key)
 {
     if (!s || !username || !key || username[0] == '\0' || key[0] == '\0')
         return MQVPN_ERR_INVALID_ARG;
+    if (strlen(username) >= sizeof(s->config.user_names[0]) ||
+        strlen(key) >= sizeof(s->config.user_keys[0]) ||
+        (s->config.n_routes > 0 && strcmp(username, "(global)") == 0))
+        return MQVPN_ERR_INVALID_ARG;
 
     /* Reject characters that would break JSON serialization in control API */
     for (const char *p = username; *p; p++) {
         if (*p == '"' || *p == '\\' || (unsigned char)*p < 0x20)
             return MQVPN_ERR_INVALID_ARG;
+    }
+
+    /* A route-enabled server authenticates ownership by the key-to-principal
+     * mapping.  Preserve at runtime the same unambiguous mapping validated at
+     * startup: neither the global PSK nor another named user may share the new
+     * key.  (With no routes configured, retain the legacy duplicate-key
+     * behavior for compatibility.) */
+    if (s->config.n_routes > 0) {
+        if (s->config.auth_key[0] != '\0' && strcmp(key, s->config.auth_key) == 0)
+            return MQVPN_ERR_INVALID_ARG;
+        for (int i = 0; i < s->config.n_users; i++) {
+            if (strcmp(s->config.user_names[i], username) != 0 &&
+                s->config.user_keys[i][0] != '\0' &&
+                strcmp(s->config.user_keys[i], key) == 0)
+                return MQVPN_ERR_INVALID_ARG;
+        }
     }
 
     for (int i = 0; i < s->config.n_users; i++) {
@@ -3280,17 +4014,37 @@ mqvpn_server_remove_user(mqvpn_server_t *s, const char *username)
     }
     if (!found) return MQVPN_ERR_INVALID_ARG;
 
+    /* Route ownership is part of the user identity.  Remove and compact the
+     * config rows together with their volatile target cache so remove+re-add
+     * cannot resurrect orphaned prefixes or misalign a target with a row. */
+    int route_dst = 0;
+    int routes_removed = 0;
+    for (int route_src = 0; route_src < s->config.n_routes; route_src++) {
+        if (strcmp(s->config.route_users[route_src], username) == 0) {
+            routes_removed++;
+            continue;
+        }
+        if (route_dst != route_src) {
+            s->config.route_prefixes[route_dst] = s->config.route_prefixes[route_src];
+            memcpy(s->config.route_users[route_dst], s->config.route_users[route_src],
+                   sizeof(s->config.route_users[route_dst]));
+            s->route_targets[route_dst] = s->route_targets[route_src];
+        }
+        route_dst++;
+    }
+    for (int i = route_dst; i < s->config.n_routes; i++) {
+        memset(&s->config.route_prefixes[i], 0, sizeof(s->config.route_prefixes[i]));
+        memset(s->config.route_users[i], 0, sizeof(s->config.route_users[i]));
+        s->route_targets[i] = NULL;
+    }
+    s->config.n_routes = route_dst;
+    if (routes_removed)
+        LOG_I(s, "removed %d native route(s) for user '%s'", routes_removed, username);
+
     /* Release pinned IP for the removed user if not currently connected */
     for (int i = 0; i < s->n_pinned_ips; i++) {
         if (strcmp(s->pinned_ips[i].username, username) != 0) continue;
-        int is_connected = 0;
-        for (int k = 1; k <= MQVPN_ADDR_POOL_MAX; k++) {
-            if (s->sessions[k] && strcmp(s->sessions[k]->username, username) == 0) {
-                is_connected = 1;
-                break;
-            }
-        }
-        if (!is_connected)
+        if (!svr_session_uses_ip(s, &s->pinned_ips[i].ip))
             mqvpn_addr_pool_release(&s->pool, &s->pinned_ips[i].ip);
         /* Remove from pinned table */
         for (int j = i + 1; j < s->n_pinned_ips; j++)
@@ -3303,7 +4057,7 @@ mqvpn_server_remove_user(mqvpn_server_t *s, const char *username)
     for (int i = 1; i <= MQVPN_ADDR_POOL_MAX; i++) {
         svr_conn_t *conn = s->sessions[i];
         if (!conn) continue;
-        if (strcmp(conn->username, username) == 0) {
+        if (strcmp(conn->auth_principal, username) == 0) {
             LOG_I(s, "disconnecting session for removed user '%s'", username);
             xqc_h3_conn_close(s->engine, &conn->cid);
         }
@@ -3484,14 +4238,7 @@ mqvpn_server_set_user_fixed_ip(mqvpn_server_t *s, const char *username, const ch
     /* ip="" — clear fixed IP */
     if (ip[0] == '\0') {
         if (pinned_idx >= 0) {
-            int is_connected = 0;
-            for (int k = 1; k <= MQVPN_ADDR_POOL_MAX; k++) {
-                if (s->sessions[k] && strcmp(s->sessions[k]->username, username) == 0) {
-                    is_connected = 1;
-                    break;
-                }
-            }
-            if (!is_connected)
+            if (!svr_session_uses_ip(s, &s->pinned_ips[pinned_idx].ip))
                 mqvpn_addr_pool_release(&s->pool, &s->pinned_ips[pinned_idx].ip);
             for (int j = pinned_idx + 1; j < s->n_pinned_ips; j++)
                 s->pinned_ips[j - 1] = s->pinned_ips[j];
@@ -3511,39 +4258,41 @@ mqvpn_server_set_user_fixed_ip(mqvpn_server_t *s, const char *username, const ch
         return MQVPN_ERR_INVALID_ARG;
     uint32_t new_offset = addr_h - base_h;
 
-    /* Release old pinned IP if not currently in use */
-    if (pinned_idx >= 0) {
-        int is_connected = 0;
-        for (int k = 1; k <= MQVPN_ADDR_POOL_MAX; k++) {
-            if (s->sessions[k] && strcmp(s->sessions[k]->username, username) == 0) {
-                is_connected = 1;
-                break;
-            }
-        }
-        if (!is_connected)
-            mqvpn_addr_pool_release(&s->pool, &s->pinned_ips[pinned_idx].ip);
-        for (int j = pinned_idx + 1; j < s->n_pinned_ips; j++)
-            s->pinned_ips[j - 1] = s->pinned_ips[j];
-        s->n_pinned_ips--;
-        pinned_idx = -1;
+    /* Reasserting the same pin is an idempotent update.  In particular, do not
+     * ask the pool to allocate an address already held by this entry. */
+    if (pinned_idx >= 0 && s->pinned_ips[pinned_idx].offset == new_offset) {
+        snprintf(s->config.user_fixed_ips[user_idx],
+                 sizeof(s->config.user_fixed_ips[user_idx]), "%s", ip);
+        return MQVPN_OK;
     }
 
-    /* Reserve new IP in pool */
+    /* A replacement does not grow the table.  Reject a genuinely new entry
+     * before reserving anything so every failure leaves runtime state intact. */
+    if (pinned_idx < 0 && s->n_pinned_ips >= MQVPN_MAX_USERS)
+        return MQVPN_ERR_MAX_CLIENTS;
+
+    /* Reserve the replacement first.  Removing/releasing the old pin before
+     * this succeeds would make an occupied new address silently discard the
+     * old runtime reservation while config.user_fixed_ips still named it. */
     struct in_addr alloc_out;
     if (mqvpn_addr_pool_alloc_at(&s->pool, new_offset, &alloc_out) < 0)
         return MQVPN_ERR_POOL_FULL;
 
-    if (s->n_pinned_ips >= MQVPN_MAX_USERS) {
-        mqvpn_addr_pool_release(&s->pool, &alloc_out);
-        return MQVPN_ERR_MAX_CLIENTS;
+    if (pinned_idx >= 0) {
+        struct in_addr old_ip = s->pinned_ips[pinned_idx].ip;
+        int old_ip_in_use = svr_session_uses_ip(s, &old_ip);
+        s->pinned_ips[pinned_idx].offset = new_offset;
+        s->pinned_ips[pinned_idx].ip = alloc_out;
+        if (!old_ip_in_use)
+            mqvpn_addr_pool_release(&s->pool, &old_ip);
+    } else {
+        int idx = s->n_pinned_ips;
+        snprintf(s->pinned_ips[idx].username,
+                 sizeof(s->pinned_ips[idx].username), "%s", username);
+        s->pinned_ips[idx].offset = new_offset;
+        s->pinned_ips[idx].ip = alloc_out;
+        s->n_pinned_ips++;
     }
-
-    int idx = s->n_pinned_ips;
-    snprintf(s->pinned_ips[idx].username, sizeof(s->pinned_ips[idx].username),
-             "%s", username);
-    s->pinned_ips[idx].offset = new_offset;
-    s->pinned_ips[idx].ip = alloc_out;
-    s->n_pinned_ips++;
 
     snprintf(s->config.user_fixed_ips[user_idx],
              sizeof(s->config.user_fixed_ips[user_idx]), "%s", ip);

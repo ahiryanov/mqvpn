@@ -95,6 +95,7 @@ enum {
     SEC_REORDER_RULE,
     SEC_HYBRID,
     SEC_ADVANCED,
+    SEC_ROUTE,
 };
 
 static int
@@ -110,6 +111,7 @@ parse_section(const char *name)
     if (strcasecmp(name, "ReorderRule") == 0) return SEC_REORDER_RULE;
     if (strcasecmp(name, "Hybrid") == 0) return SEC_HYBRID;
     if (strcasecmp(name, "Advanced") == 0) return SEC_ADVANCED;
+    if (strcasecmp(name, "Route") == 0) return SEC_ROUTE;
     return -1;
 }
 
@@ -127,8 +129,94 @@ section_name(int section)
     case SEC_REORDER_RULE: return "ReorderRule";
     case SEC_HYBRID: return "Hybrid";
     case SEC_ADVANCED: return "Advanced";
+    case SEC_ROUTE: return "Route";
     default: return "?";
     }
+}
+
+static int
+route_user_exists_filecfg(const mqvpn_file_config_t *cfg, const char *user)
+{
+    for (int i = 0; i < cfg->n_users; i++)
+        if (strcmp(cfg->user_names[i], user) == 0) return 1;
+    return 0;
+}
+
+static int
+route_prefix_equal_filecfg(const char *a, const char *b)
+{
+    mqvpn_cidr_entry_t ca, cb;
+    return mqvpn_parse_cidr(a, &ca) == 0 && mqvpn_parse_cidr(b, &cb) == 0 &&
+           ca.family == cb.family && ca.prefix_len == cb.prefix_len &&
+           memcmp(ca.net, cb.net, sizeof(ca.net)) == 0;
+}
+
+static int
+copy_string_strict(char *dst, size_t dst_len, const char *src)
+{
+    size_t len;
+    if (!dst || dst_len == 0 || !src || (len = strlen(src)) >= dst_len) return -1;
+    memcpy(dst, src, len + 1);
+    return 0;
+}
+
+/* Validate the current INI [Route] slot once all its fields have been read.
+ * Returns 0 for a complete, valid entry; -1 is a hard config-load failure. */
+static int
+route_section_finish(mqvpn_file_config_t *cfg, int route_index, int lineno,
+                     const char *path)
+{
+    if (route_index < 0) return 0;
+    mqvpn_route_config_t *route = &cfg->routes[route_index];
+    mqvpn_cidr_entry_t parsed;
+    if (route->invalid || !route->has_user || !route->has_prefix ||
+        route->user[0] == '\0' || strcmp(route->user, "(global)") == 0 ||
+        route->prefix[0] == '\0' ||
+        mqvpn_parse_cidr(route->prefix, &parsed) != 0) {
+        LOG_WRN("%s:%d: [Route] requires valid User and Prefix CIDR", path, lineno);
+        return -1;
+    }
+    for (int i = 0; i < route_index; i++) {
+        if (!route_prefix_equal_filecfg(cfg->routes[i].prefix, route->prefix)) continue;
+        if (strcmp(cfg->routes[i].user, route->user) != 0) {
+            LOG_WRN("%s:%d: [Route] exact prefix conflicts with user '%s'", path,
+                    lineno, cfg->routes[i].user);
+            return -1;
+        }
+        /* Same normalized prefix and owner is idempotent: discard this slot. */
+        memset(route, 0, sizeof(*route));
+        cfg->n_routes--;
+        return 0;
+    }
+    return 0;
+}
+
+static int
+routes_validate_owners(const mqvpn_file_config_t *cfg, int lineno, const char *path)
+{
+    for (int i = 0; i < cfg->n_routes; i++) {
+        if (strcmp(cfg->routes[i].user, "(global)") == 0 ||
+            !route_user_exists_filecfg(cfg, cfg->routes[i].user)) {
+            LOG_WRN("%s:%d: [Route] owner '%s' is not a named user", path, lineno,
+                    cfg->routes[i].user);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void
+routes_prune_missing_users_filecfg(mqvpn_file_config_t *cfg)
+{
+    int out = 0;
+    for (int i = 0; i < cfg->n_routes; i++) {
+        if (!route_user_exists_filecfg(cfg, cfg->routes[i].user)) continue;
+        if (out != i) cfg->routes[out] = cfg->routes[i];
+        out++;
+    }
+    for (int i = out; i < cfg->n_routes; i++)
+        memset(&cfg->routes[i], 0, sizeof(cfg->routes[i]));
+    cfg->n_routes = out;
 }
 
 /* Split comma-separated DNS list into cfg->dns_servers[] */
@@ -168,6 +256,11 @@ add_user_entry(mqvpn_file_config_t *cfg, const char *name, const char *key,
 {
     if (!name || !key || name[0] == '\0' || key[0] == '\0') {
         LOG_WRN("%s:%d: invalid user entry", path, lineno);
+        return;
+    }
+    if (strlen(name) >= sizeof(cfg->user_names[0])) {
+        LOG_WRN("%s:%d: username is too long (max %zu bytes)", path, lineno,
+                sizeof(cfg->user_names[0]) - 1);
         return;
     }
 
@@ -294,8 +387,21 @@ static int
 json_read_users(mqvpn_file_config_t *cfg, const char *p)
 {
     if (!cfg || !p || *p != '[') return -1;
-    cfg->n_users = 0;
-    return mqvpn_json_parse_users(p, cfg, json_add_user_cb);
+
+    /* Stage replacement arrays so malformed JSON keeps the previous
+     * credential/route ownership state intact. */
+    mqvpn_file_config_t *staged = calloc(1, sizeof(*staged));
+    if (!staged) return -1;
+    int rc = mqvpn_json_parse_users(p, staged, json_add_user_cb);
+    if (rc == 0) {
+        memcpy(cfg->user_names, staged->user_names, sizeof(cfg->user_names));
+        memcpy(cfg->user_keys, staged->user_keys, sizeof(cfg->user_keys));
+        memcpy(cfg->user_fixed_ips, staged->user_fixed_ips,
+               sizeof(cfg->user_fixed_ips));
+        cfg->n_users = staged->n_users;
+    }
+    free(staged);
+    return rc;
 }
 
 /* Parse the "reorder_rules" JSON array of {proto, port, profile} objects into
@@ -1090,6 +1196,94 @@ json_read_path_policy(mqvpn_file_config_t *cfg, const char *p)
     return (*p == ']') ? 0 : -1;
 }
 
+static int
+json_read_string_strict_bounded(const char *value, const char *obj_end,
+                                char *out, size_t out_len)
+{
+    if (!value || !obj_end || !out || out_len == 0 || value >= obj_end ||
+        *value != '"')
+        return -1;
+    const char *p = value + 1;
+    size_t n = 0;
+    while (p < obj_end && *p && *p != '"') {
+        if (*p == '\\') {
+            p++;
+            if (p >= obj_end || *p == '\0') return -1;
+        }
+        if (n + 1 >= out_len) return -1;
+        out[n++] = *p++;
+    }
+    if (p >= obj_end || *p != '"') return -1;
+    out[n] = '\0';
+    return 0;
+}
+
+static int
+json_read_routes(mqvpn_file_config_t *cfg, const char *p)
+{
+    if (!cfg || !p || *p != '[') return -1;
+
+    mqvpn_file_config_t *staged = malloc(sizeof(*staged));
+    if (!staged) return -1;
+    memcpy(staged, cfg, sizeof(*staged));
+    memset(staged->routes, 0, sizeof(staged->routes));
+    staged->n_routes = 0;
+
+    int rc = -1;
+    p = json_skip_ws(p + 1);
+
+    while (*p && *p != ']') {
+        if (*p != '{') goto out;
+        const char *obj_end = json_object_end(p);
+        if (!obj_end) goto out;
+
+        mqvpn_route_config_t route;
+        mqvpn_cidr_entry_t parsed;
+        memset(&route, 0, sizeof(route));
+        const char *uv = json_find_key_bounded(p, obj_end, "user");
+        const char *pv = json_find_key_bounded(p, obj_end, "prefix");
+        if (json_read_string_strict_bounded(uv, obj_end, route.user,
+                                            sizeof(route.user)) != 0 ||
+            json_read_string_strict_bounded(pv, obj_end, route.prefix,
+                                            sizeof(route.prefix)) != 0 ||
+            route.user[0] == '\0' || strcmp(route.user, "(global)") == 0 ||
+            route.prefix[0] == '\0' ||
+            mqvpn_parse_cidr(route.prefix, &parsed) != 0 ||
+            !route_user_exists_filecfg(staged, route.user))
+            goto out;
+
+        int duplicate = 0;
+        for (int i = 0; i < staged->n_routes; i++) {
+            if (!route_prefix_equal_filecfg(staged->routes[i].prefix, route.prefix))
+                continue;
+            if (strcmp(staged->routes[i].user, route.user) != 0) goto out;
+            duplicate = 1;
+            break;
+        }
+        if (!duplicate) {
+            if (staged->n_routes >= MQVPN_CONFIG_MAX_ROUTES) goto out;
+            route.has_user = 1;
+            route.has_prefix = 1;
+            staged->routes[staged->n_routes++] = route;
+        }
+
+        p = json_skip_ws(obj_end + 1);
+        if (*p == ',')
+            p = json_skip_ws(p + 1);
+        else if (*p != ']')
+            goto out;
+    }
+    if (*p != ']') goto out;
+
+    memcpy(cfg->routes, staged->routes, sizeof(cfg->routes));
+    cfg->n_routes = staged->n_routes;
+    rc = 0;
+
+out:
+    free(staged);
+    return rc;
+}
+
 /* Handle a key=value pair in the given section */
 static void
 handle_kv(mqvpn_file_config_t *cfg, int section, const char *key, const char *val,
@@ -1109,6 +1303,39 @@ handle_kv(mqvpn_file_config_t *cfg, int section, const char *key, const char *va
             return;
         }
         break;
+    case SEC_ROUTE: {
+        if (cfg->n_routes <= 0) return;
+        mqvpn_route_config_t *route = &cfg->routes[cfg->n_routes - 1];
+        if (strcasecmp(key, "User") == 0) {
+            if (route->has_user || val[0] == '\0' ||
+                copy_string_strict(route->user, sizeof(route->user), val) != 0) {
+                route->invalid = 1;
+                LOG_WRN("%s:%d: invalid or overlong [Route] User", path, lineno);
+            } else {
+                route->has_user = 1;
+            }
+            return;
+        }
+        if (strcasecmp(key, "Prefix") == 0) {
+            mqvpn_cidr_entry_t parsed;
+            if (route->has_prefix || val[0] == '\0' ||
+                strlen(val) >= sizeof(route->prefix) ||
+                mqvpn_parse_cidr(val, &parsed) != 0) {
+                /* Leave the field empty so route_section_finish turns this
+                 * into a hard load error rather than accepting stale input. */
+                route->prefix[0] = '\0';
+                route->invalid = 1;
+                LOG_WRN("%s:%d: invalid [Route] Prefix CIDR", path, lineno);
+            } else {
+                memcpy(route->prefix, val, strlen(val) + 1);
+                route->has_prefix = 1;
+            }
+            return;
+        }
+        route->invalid = 1;
+        LOG_WRN("%s:%d: unknown key '%s' in [Route]", path, lineno, key);
+        return;
+    }
     case SEC_MULTIPATH:
         if (strcasecmp(key, "Path") == 0) {
             if (cfg->n_paths < MQVPN_CONFIG_MAX_PATHS) {
@@ -1326,8 +1553,36 @@ mqvpn_config_load_json_filecfg(mqvpn_file_config_t *cfg, const char *json_text)
         }
     }
 
-    v = json_find_key(json_text, "users");
-    if (v && json_read_users(cfg, v) < 0) return -1;
+    const char *users_v = json_find_key(json_text, "users");
+    const char *routes_v = json_find_key(json_text, "routes");
+    if (users_v || routes_v) {
+        /* Credential rows and their route ownership are one atomic policy.
+         * Work on a clone, then commit only after every supplied array parses. */
+        mqvpn_file_config_t *policy = malloc(sizeof(*policy));
+        if (!policy) return -1;
+        memcpy(policy, cfg, sizeof(*policy));
+
+        int policy_rc = 0;
+        if (users_v) {
+            policy_rc = json_read_users(policy, users_v);
+            if (policy_rc == 0) routes_prune_missing_users_filecfg(policy);
+        }
+        /* Parse users first regardless of textual JSON key order. */
+        if (policy_rc == 0 && routes_v)
+            policy_rc = json_read_routes(policy, routes_v);
+
+        if (policy_rc == 0) {
+            memcpy(cfg->user_names, policy->user_names, sizeof(cfg->user_names));
+            memcpy(cfg->user_keys, policy->user_keys, sizeof(cfg->user_keys));
+            memcpy(cfg->user_fixed_ips, policy->user_fixed_ips,
+                   sizeof(cfg->user_fixed_ips));
+            cfg->n_users = policy->n_users;
+            memcpy(cfg->routes, policy->routes, sizeof(cfg->routes));
+            cfg->n_routes = policy->n_routes;
+        }
+        free(policy);
+        if (policy_rc != 0) return -1;
+    }
 
     v = json_find_key(json_text, "reorder_rules");
     if (v && json_read_reorder_rules(cfg, v) < 0) return -1;
@@ -1472,6 +1727,8 @@ mqvpn_config_load(mqvpn_file_config_t *cfg, const char *path)
 
     int lineno = 0;
     int section = SEC_NONE;
+    int route_index = -1;
+    int route_error = 0;
     char *line = strtok(buf, "\n");
     while (line) {
         lineno++;
@@ -1483,9 +1740,15 @@ mqvpn_config_load(mqvpn_file_config_t *cfg, const char *path)
         }
 
         if (*t == '[') {
+            if (section == SEC_ROUTE &&
+                route_section_finish(cfg, route_index, lineno, path) != 0) {
+                route_error = 1;
+            }
+            route_index = -1;
             char *end = strchr(t, ']');
             if (!end) {
                 LOG_WRN("%s:%d: malformed section header", path, lineno);
+                section = SEC_NONE;
                 line = strtok(NULL, "\n");
                 continue;
             }
@@ -1505,6 +1768,17 @@ mqvpn_config_load(mqvpn_file_config_t *cfg, const char *path)
                     if (reorder_rule_begin(cfg, lineno, path) < 0) {
                         section = SEC_NONE;
                     }
+                } else if (section == SEC_ROUTE) {
+                    if (cfg->n_routes >= MQVPN_CONFIG_MAX_ROUTES) {
+                        LOG_WRN("%s:%d: max %d routes supported", path, lineno,
+                                MQVPN_CONFIG_MAX_ROUTES);
+                        route_error = 1;
+                        section = SEC_NONE;
+                    } else {
+                        route_index = cfg->n_routes++;
+                        memset(&cfg->routes[route_index], 0,
+                               sizeof(cfg->routes[route_index]));
+                    }
                 }
             }
             line = strtok(NULL, "\n");
@@ -1514,6 +1788,10 @@ mqvpn_config_load(mqvpn_file_config_t *cfg, const char *path)
         char *eq = strchr(t, '=');
         if (!eq) {
             LOG_WRN("%s:%d: malformed line (no '=')", path, lineno);
+            if (section == SEC_ROUTE && route_index >= 0) {
+                cfg->routes[route_index].invalid = 1;
+                route_error = 1;
+            }
             line = strtok(NULL, "\n");
             continue;
         }
@@ -1523,6 +1801,11 @@ mqvpn_config_load(mqvpn_file_config_t *cfg, const char *path)
         line = strtok(NULL, "\n");
     }
 
+    if (section == SEC_ROUTE &&
+        route_section_finish(cfg, route_index, lineno, path) != 0)
+        route_error = 1;
+    if (routes_validate_owners(cfg, lineno, path) != 0) route_error = 1;
+
     free(buf);
-    return 0;
+    return route_error ? -1 : 0;
 }

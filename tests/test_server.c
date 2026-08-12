@@ -36,6 +36,13 @@
 #include <xquic/xquic.h>
 #include <time.h>
 
+/* Hidden production-helper hook: keeps this invariant test independent of an
+ * xquic request object while exercising the exact per-connection tracker. */
+extern int mqvpn_server_test_address_request_id_batches(const uint64_t *ids,
+                                                        size_t n_ids,
+                                                        size_t split);
+extern int mqvpn_server_test_close_first_connect_ip(mqvpn_server_t *s);
+
 /* Test infrastructure */
 
 static int g_tests_run = 0;
@@ -216,6 +223,102 @@ TEST(server_destroy_null)
 {
     /* Must not crash */
     mqvpn_server_destroy(NULL);
+}
+
+TEST(server_native_route_validation)
+{
+    mqvpn_server_callbacks_t cbs = MQVPN_SERVER_CALLBACKS_INIT;
+    cbs.tun_output = mock_tun_output;
+    cbs.tunnel_config_ready = mock_tunnel_config_ready;
+
+    /* Distinct keyed owners and nested prefixes are valid; runtime LPM owns
+     * the overlap rather than rejecting the configuration. */
+    mqvpn_config_t *cfg = make_server_config();
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "alice", "alice-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "bob", "bob-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "alice", "10.100.0.0/16"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "bob", "10.100.8.0/24"), MQVPN_OK);
+    mqvpn_server_t *s = mqvpn_server_new(cfg, &cbs, NULL);
+    ASSERT_NOT_NULL(s);
+    mqvpn_server_destroy(s);
+    mqvpn_config_free(cfg);
+
+    /* A routed principal must not be reachable through the global PSK. */
+    cfg = make_server_config();
+    ASSERT_EQ(mqvpn_config_set_auth_key(cfg, "shared-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "alice", "shared-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "alice", "10.100.0.0/16"), MQVPN_OK);
+    ASSERT_NULL(mqvpn_server_new(cfg, &cbs, NULL));
+    mqvpn_config_free(cfg);
+
+    /* Nor may two named credentials share a routed owner's key. */
+    cfg = make_server_config();
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "alice", "shared-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "bob", "shared-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "alice", "10.100.0.0/16"), MQVPN_OK);
+    ASSERT_NULL(mqvpn_server_new(cfg, &cbs, NULL));
+    mqvpn_config_free(cfg);
+
+    /* Native prefixes and the tunnel address pool must stay disjoint. */
+    cfg = make_server_config();
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "alice", "alice-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "alice", "10.0.0.0/25"), MQVPN_OK);
+    ASSERT_NULL(mqvpn_server_new(cfg, &cbs, NULL));
+    mqvpn_config_free(cfg);
+}
+
+TEST(server_native_route_runtime_key_invariant)
+{
+    mqvpn_server_callbacks_t cbs = MQVPN_SERVER_CALLBACKS_INIT;
+    cbs.tun_output = mock_tun_output;
+    cbs.tunnel_config_ready = mock_tunnel_config_ready;
+
+    mqvpn_config_t *cfg = make_server_config();
+    ASSERT_EQ(mqvpn_config_set_auth_key(cfg, "global-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "alice", "alice-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "bob", "bob-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "alice", "10.100.0.0/16"), MQVPN_OK);
+    mqvpn_server_t *s = mqvpn_server_new(cfg, &cbs, NULL);
+    ASSERT_NOT_NULL(s);
+    mqvpn_config_free(cfg);
+
+    ASSERT_EQ(mqvpn_server_add_user(s, "charlie", "alice-key"), MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_server_add_user(s, "charlie", "global-key"), MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_server_add_user(s, "bob", "alice-key"), MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_server_add_user(s, "(global)", "unique-key"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_server_add_user(s, "charlie", "charlie-key"), MQVPN_OK);
+
+    mqvpn_server_destroy(s);
+}
+
+TEST(server_address_request_id_history)
+{
+    /* Different IDs remain valid across successive capsules. */
+    const uint64_t distinct[] = {1, 2, 3, 4};
+    ASSERT_EQ(mqvpn_server_test_address_request_id_batches(distinct, 4, 2), 0);
+
+    /* RFC 9484 uniqueness spans the request stream, not only one capsule. */
+    const uint64_t cross_capsule_reuse[] = {11, 12, 12, 13};
+    ASSERT_EQ(mqvpn_server_test_address_request_id_batches(cross_capsule_reuse, 4, 2),
+              -1);
+
+    const uint64_t same_capsule_reuse[] = {21, 21};
+    ASSERT_EQ(mqvpn_server_test_address_request_id_batches(same_capsule_reuse, 2, 0),
+              -1);
+
+    const uint64_t zero_id[] = {0};
+    ASSERT_EQ(mqvpn_server_test_address_request_id_batches(zero_id, 1, 0), -1);
+
+    /* The history is deliberately bounded, so a peer cannot grow one
+     * connection without limit by issuing fresh IDs forever. */
+    const size_t excess_count = (size_t)MQVPN_MAX_ROUTES + 3u;
+    uint64_t *excess = calloc(excess_count, sizeof(*excess));
+    ASSERT_NOT_NULL(excess);
+    for (size_t i = 0; i < excess_count; i++) excess[i] = i + 1u;
+    ASSERT_EQ(mqvpn_server_test_address_request_id_batches(excess, excess_count, 0),
+              -1);
+    free(excess);
 }
 
 TEST(server_egress_fd_budget)
@@ -963,6 +1066,11 @@ TEST(server_session_quic_loopback)
 
     /* Server setup */
     mqvpn_config_t *svr_cfg = make_server_config();
+    ASSERT_EQ(mqvpn_config_set_subnet6(svr_cfg, "fd00::/112"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_user(svr_cfg, "alice", "alice-route-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_user(svr_cfg, "bob", "bob-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_user(svr_cfg, "carol", "carol-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_route(svr_cfg, "alice", "10.111.252.0/22"), MQVPN_OK);
     mqvpn_server_callbacks_t svr_cbs = MQVPN_SERVER_CALLBACKS_INIT;
     svr_cbs.tun_output = mock_tun_output;
     svr_cbs.tunnel_config_ready = mock_tunnel_config_ready;
@@ -982,6 +1090,8 @@ TEST(server_session_quic_loopback)
     mqvpn_config_t *cli_cfg = mqvpn_config_new();
     mqvpn_config_set_server(cli_cfg, "127.0.0.1", ntohs(svr_addr.sin_port));
     mqvpn_config_set_insecure(cli_cfg, 1);
+    mqvpn_config_set_auth_key(cli_cfg, "alice-route-key");
+    mqvpn_config_set_auth_username(cli_cfg, "alice");
     mqvpn_config_set_log_level(cli_cfg, MQVPN_LOG_ERROR);
 
     mqvpn_client_callbacks_t cli_cbs = MQVPN_CLIENT_CALLBACKS_INIT;
@@ -1041,10 +1151,62 @@ TEST(server_session_quic_loopback)
     ASSERT_EQ(g_cli_tunnel_info.assigned_ip[1], 0);
     ASSERT_EQ(g_cli_tunnel_info.assigned_ip[2], 0);
     ASSERT_EQ(g_cli_tunnel_info.assigned_ip[3], 2);
+    /* IPv4 and IPv6 primaries must arrive in the same ADDRESS_ASSIGN
+     * replacement snapshot; otherwise the second family revokes the first
+     * and the one-shot platform callback races without IPv6. */
+    ASSERT_EQ(g_cli_tunnel_info.has_v6, 1);
+    ASSERT_EQ(g_cli_tunnel_info.assigned_prefix6, 112);
 
     /* Activate TUN: ESTABLISHED */
     mqvpn_client_set_tun_active(cli, 1, -1);
     ASSERT_EQ(mqvpn_client_get_state(cli), MQVPN_STATE_ESTABLISHED);
+
+    /* Native uplink: a LAN source authorized by ADDRESS_ASSIGN crosses the
+     * client source gate and the server anti-spoof gate without NAT. */
+    uint8_t lan_uplink[40];
+    memset(lan_uplink, 0, sizeof(lan_uplink));
+    lan_uplink[0] = 0x45;
+    lan_uplink[2] = 0;
+    lan_uplink[3] = sizeof(lan_uplink);
+    lan_uplink[8] = 64;
+    lan_uplink[9] = 17;
+    lan_uplink[12] = 10;
+    lan_uplink[13] = 111;
+    lan_uplink[14] = 252;
+    lan_uplink[15] = 10;
+    lan_uplink[16] = 9;
+    lan_uplink[17] = 9;
+    lan_uplink[18] = 9;
+    lan_uplink[19] = 9;
+
+    int uplink_baseline = g_tun_output_called;
+    ASSERT_EQ(mqvpn_client_on_tun_packet(cli, lan_uplink, sizeof(lan_uplink)), MQVPN_OK);
+    for (int i = 0; i < 5000; i++) {
+        drain_and_tick(svr, svr_fd, cli, cli_fd, path_h);
+        if (g_tun_output_called > uplink_baseline) break;
+        struct pollfd pfds[2] = {
+            {.fd = svr_fd, .events = POLLIN},
+            {.fd = cli_fd, .events = POLLIN},
+        };
+        int w = poll(pfds, 2, 5);
+        i += (w == 0) ? 5 : 1;
+    }
+    ASSERT_EQ(g_tun_output_called, uplink_baseline + 1);
+
+    /* A source outside both the exact tunnel IP and owned routed prefix is
+     * dropped before it can reach the network. */
+    lan_uplink[13] = 112;
+    int spoof_baseline = g_tun_output_called;
+    ASSERT_EQ(mqvpn_client_on_tun_packet(cli, lan_uplink, sizeof(lan_uplink)), MQVPN_OK);
+    for (int i = 0; i < 20; i++) {
+        drain_and_tick(svr, svr_fd, cli, cli_fd, path_h);
+        struct pollfd pfds[2] = {
+            {.fd = svr_fd, .events = POLLIN},
+            {.fd = cli_fd, .events = POLLIN},
+        };
+        poll(pfds, 2, 2);
+    }
+    ASSERT_EQ(g_tun_output_called, spoof_baseline);
 
     /* Phase 2: set_tun_active sends packet output through tun_output */
     /* Build IPv4 packet destined for client's assigned IP */
@@ -1079,6 +1241,30 @@ TEST(server_session_quic_loopback)
     }
     ASSERT_EQ(g_cli_tun_output_called, baseline + 1);
 
+    /* Native downlink: an inner destination in alice's routed prefix is
+     * selected by server LPM and delivered through the same CONNECT-IP
+     * session to the LAN-facing client TUN. */
+    uint8_t lan_downlink[40];
+    memcpy(lan_downlink, tun_pkt, sizeof(lan_downlink));
+    lan_downlink[16] = 10;
+    lan_downlink[17] = 111;
+    lan_downlink[18] = 252;
+    lan_downlink[19] = 20;
+    int lan_dl_baseline = g_cli_tun_output_called;
+    ASSERT_EQ(mqvpn_server_on_tun_packet(svr, lan_downlink, sizeof(lan_downlink)),
+              MQVPN_OK);
+    for (int i = 0; i < 5000; i++) {
+        drain_and_tick(svr, svr_fd, cli, cli_fd, path_h);
+        if (g_cli_tun_output_called > lan_dl_baseline) break;
+        struct pollfd pfds[2] = {
+            {.fd = svr_fd, .events = POLLIN},
+            {.fd = cli_fd, .events = POLLIN},
+        };
+        int w = poll(pfds, 2, 5);
+        i += (w == 0) ? 5 : 1;
+    }
+    ASSERT_EQ(g_cli_tun_output_called, lan_dl_baseline + 1);
+
     /* Phase 2b: DL TTL=1 is dropped; ICMP Time Exceeded via tun_output */
     uint8_t ttl1_pkt[40];
     memset(ttl1_pkt, 0, sizeof(ttl1_pkt));
@@ -1109,13 +1295,27 @@ TEST(server_session_quic_loopback)
     }
     ASSERT_EQ(g_cli_tun_output_called, cli_baseline);
 
-    /* Phase 3: client disconnect releases the session */
-    mqvpn_client_disconnect(cli);
+    /* Runtime pin changes while alice is connected must release reservations
+     * by exact address, not suppress every release merely because alice has a
+     * session.  Her live tunnel still owns .2, so the intermediate .10 and
+     * then-cleared .11 reservations must immediately become reusable. */
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(svr, "alice", "10.0.0.10"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(svr, "alice", "10.0.0.11"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(svr, "bob", "10.0.0.10"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(svr, "alice", ""), MQVPN_OK);
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(svr, "carol", "10.0.0.11"), MQVPN_OK);
 
-    /* Pump to deliver CONNECTION_CLOSE to server */
+    /* Phase 3: a CONNECT-IP request close (without a peer connection close)
+     * must tear down its owning H3 connection so sessions[]/n_sessions and the
+     * address allocation cannot remain stranded. */
+    ASSERT_EQ(mqvpn_server_get_n_clients(svr), 1);
+    ASSERT_EQ(mqvpn_server_test_close_first_connect_ip(svr), 0);
+
+    /* Pump the asynchronous local H3 close through conn-close cleanup. */
     for (int i = 0; i < 5000; i++) {
         drain_and_tick(svr, svr_fd, cli, cli_fd, path_h);
-        if (g_client_disconnected_called > 0) break;
+        if (g_client_disconnected_called > 0 && mqvpn_server_get_n_clients(svr) == 0)
+            break;
         struct pollfd pfds[2] = {
             {.fd = svr_fd, .events = POLLIN},
             {.fd = cli_fd, .events = POLLIN},
@@ -1125,6 +1325,7 @@ TEST(server_session_quic_loopback)
     }
     ASSERT_EQ(g_client_disconnected_called, 1);
     ASSERT_EQ(g_last_disconnected_session_id, g_last_session_id);
+    ASSERT_EQ(mqvpn_server_get_n_clients(svr), 0);
 
     /* Cleanup */
     mqvpn_client_destroy(cli);
@@ -1455,6 +1656,7 @@ TEST(server_set_user_fixed_ip_api)
     mqvpn_config_t *cfg = make_server_config();
     mqvpn_config_add_user(cfg, "alice", "alice-key");
     mqvpn_config_add_user(cfg, "bob", "bob-key");
+    mqvpn_config_add_user(cfg, "carol", "carol-key");
 
     mqvpn_server_callbacks_t cbs = MQVPN_SERVER_CALLBACKS_INIT;
     cbs.tun_output = mock_tun_output;
@@ -1469,17 +1671,27 @@ TEST(server_set_user_fixed_ip_api)
     /* Same IP for bob must fail */
     ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "bob", "10.0.0.10"), MQVPN_ERR_POOL_FULL);
 
-    /* Update alice to a different IP — old one is freed */
-    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "alice", "10.0.0.11"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "bob", "10.0.0.11"), MQVPN_OK);
 
-    /* Old IP 10.0.0.10 is now free, bob can take it */
-    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "bob", "10.0.0.10"), MQVPN_OK);
+    /* A failed replacement is atomic: alice keeps the old reservation. */
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "alice", "10.0.0.11"),
+              MQVPN_ERR_POOL_FULL);
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "carol", "10.0.0.10"),
+              MQVPN_ERR_POOL_FULL);
+
+    /* Same-address replacement is idempotent. */
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "alice", "10.0.0.10"), MQVPN_OK);
+
+    /* A successful update releases alice's old address. */
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "alice", "10.0.0.12"), MQVPN_OK);
+
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "carol", "10.0.0.10"), MQVPN_OK);
 
     /* Clear bob's IP */
     ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "bob", ""), MQVPN_OK);
 
     /* Error cases */
-    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "carol", "10.0.0.5"),
+    ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "dave", "10.0.0.5"),
               MQVPN_ERR_INVALID_ARG); /* unknown user */
     ASSERT_EQ(mqvpn_server_set_user_fixed_ip(s, "alice", "not-an-ip"),
               MQVPN_ERR_INVALID_ARG); /* bad IP string */
@@ -1729,6 +1941,9 @@ main(void)
     run_server_new_missing_tunnel_config_ready();
     run_server_new_destroy();
     run_server_destroy_null();
+    run_server_native_route_validation();
+    run_server_native_route_runtime_key_invariant();
+    run_server_address_request_id_history();
     run_server_egress_fd_budget();
 
     /* Lifecycle */

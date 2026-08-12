@@ -15,6 +15,7 @@ libmqvpn.so.0 libmqvpn0 #MINVER#
  mqvpn_client_set_tun_active@Base 0.5.0
  mqvpn_client_tick@Base 0.5.0
  mqvpn_config_add_user@Base 0.5.0
+ mqvpn_config_add_route@Base 0.16.0
  mqvpn_config_free@Base 0.5.0
  mqvpn_config_load_json@Base 0.5.0
  mqvpn_config_new@Base 0.5.0

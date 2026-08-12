@@ -784,6 +784,10 @@ main(int argc, char *argv[])
             .push_path_labels = eff_push_path_labels,
             /* [Multipath] path_policy; JSON-only, no CLI equivalent. */
             .n_path_policy = file_cfg.n_path_policy,
+            /* Server-side native routed prefixes; no CLI equivalent. Owner
+             * existence is re-validated after CLI user overrides in the
+             * public config bridge. */
+            .n_routes = file_cfg.n_routes,
         };
         for (int i = 0; i < eff_n_users; i++) {
             cfg.user_names[i] = eff_user_names[i];
@@ -799,6 +803,12 @@ main(int argc, char *argv[])
             cfg.path_policy[i].weight = file_cfg.path_policy[i].weight;
             cfg.path_policy[i].has_dscp_mask = file_cfg.path_policy[i].has_dscp_mask;
             cfg.path_policy[i].dscp_mask = file_cfg.path_policy[i].dscp_mask;
+        }
+        for (int i = 0; i < file_cfg.n_routes; i++) {
+            mqvpn_copy_str(cfg.routes[i].user, sizeof(cfg.routes[i].user),
+                           file_cfg.routes[i].user);
+            mqvpn_copy_str(cfg.routes[i].prefix, sizeof(cfg.routes[i].prefix),
+                           file_cfg.routes[i].prefix);
         }
 #ifdef _WIN32
         return win_platform_run_server(&cfg);

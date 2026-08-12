@@ -128,6 +128,183 @@ TEST(config_add_remove_user)
     ASSERT_EQ(mqvpn_config_add_user(NULL, "alice", "k"), MQVPN_ERR_INVALID_ARG);
     ASSERT_EQ(mqvpn_config_add_user(cfg, "", "k"), MQVPN_ERR_INVALID_ARG);
     ASSERT_EQ(mqvpn_config_remove_user(NULL, "alice"), MQVPN_ERR_INVALID_ARG);
+
+    char max_name[64];
+    memset(max_name, 'm', sizeof(max_name) - 1);
+    max_name[sizeof(max_name) - 1] = '\0';
+    ASSERT_EQ(mqvpn_config_add_user(cfg, max_name, "max-key"), MQVPN_OK);
+    char overlong_name[65];
+    memset(overlong_name, 'x', sizeof(overlong_name) - 1);
+    overlong_name[sizeof(overlong_name) - 1] = '\0';
+    ASSERT_EQ(mqvpn_config_add_user(cfg, overlong_name, "bad-key"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(cfg->n_users, 2);
+    mqvpn_config_free(cfg);
+}
+
+TEST(config_add_route_and_user_cascade)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "alice", "a-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "bob", "b-key"), MQVPN_OK);
+
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "alice", "10.1.2.3/16"), MQVPN_OK);
+    ASSERT_EQ(cfg->n_routes, 1);
+    ASSERT_EQ(cfg->route_prefixes[0].family, 4);
+    ASSERT_EQ(cfg->route_prefixes[0].prefix_len, 16);
+    ASSERT_EQ(cfg->route_prefixes[0].net[0], 10);
+    ASSERT_EQ(cfg->route_prefixes[0].net[1], 1);
+    ASSERT_EQ(cfg->route_prefixes[0].net[2], 0);
+    ASSERT_STR_EQ(cfg->route_users[0], "alice");
+
+    /* Canonically equal row for the same owner is idempotent. */
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "alice", "10.1.99.9/16"), MQVPN_OK);
+    ASSERT_EQ(cfg->n_routes, 1);
+    /* Exact normalized prefix cannot be reassigned. */
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "bob", "10.1.8.8/16"),
+              MQVPN_ERR_INVALID_ARG);
+    /* Properly nested overlap is valid; runtime resolves it by LPM. */
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "bob", "10.1.8.0/24"), MQVPN_OK);
+    ASSERT_EQ(cfg->n_routes, 2);
+
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "missing", "10.2.0.0/16"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "alice", "10.2.0.0"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_add_route(NULL, "alice", "10.2.0.0/16"),
+              MQVPN_ERR_INVALID_ARG);
+
+    char overlong[65];
+    memset(overlong, 'x', sizeof(overlong) - 1);
+    overlong[sizeof(overlong) - 1] = '\0';
+    ASSERT_EQ(mqvpn_config_add_route(cfg, overlong, "10.2.0.0/16"),
+              MQVPN_ERR_INVALID_ARG);
+
+    /* This spelling is the authentication sentinel for the legacy global
+     * PSK, never a named principal that may own routed authority. */
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "(global)", "global-named-key"), MQVPN_OK);
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "(global)", "10.2.0.0/16"),
+              MQVPN_ERR_INVALID_ARG);
+
+    ASSERT_EQ(mqvpn_config_remove_user(cfg, "alice"), MQVPN_OK);
+    ASSERT_EQ(cfg->n_routes, 1);
+    ASSERT_STR_EQ(cfg->route_users[0], "bob");
+    mqvpn_config_free(cfg);
+}
+
+TEST(config_add_route_capacity)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    ASSERT_EQ(mqvpn_config_add_user(cfg, "alice", "key"), MQVPN_OK);
+    char prefix[64];
+    for (int i = 0; i < MQVPN_MAX_ROUTES; i++) {
+        snprintf(prefix, sizeof(prefix), "2001:db8:%x::/48", i);
+        ASSERT_EQ(mqvpn_config_add_route(cfg, "alice", prefix), MQVPN_OK);
+    }
+    ASSERT_EQ(cfg->n_routes, MQVPN_MAX_ROUTES);
+    ASSERT_EQ(mqvpn_config_add_route(cfg, "alice", "2001:db8:ffff::/48"),
+              MQVPN_ERR_MAX_CLIENTS);
+    mqvpn_config_free(cfg);
+}
+
+TEST(config_load_json_routes_replace)
+{
+    mqvpn_config_t *cfg = mqvpn_config_new();
+    const char *first =
+        "{\"routes\":[{\"user\":\"alice\",\"prefix\":\"10.4.5.6/16\"}],"
+        "\"users\":[{\"name\":\"alice\",\"key\":\"key\"}]}";
+    ASSERT_EQ(mqvpn_config_load_json(cfg, first), MQVPN_OK);
+    ASSERT_EQ(cfg->n_routes, 1);
+    ASSERT_EQ(cfg->route_prefixes[0].net[2], 0);
+    ASSERT_EQ(cfg->route_prefixes[0].net[3], 0);
+
+    /* A malformed users replacement is atomic: neither the old credentials
+     * nor their route authority is partially discarded. */
+    ASSERT_EQ(mqvpn_config_load_json(
+                  cfg, "{\"users\":[{\"name\":\"bob\",\"key\":\"b\"},"
+                       "{\"name\":\"broken\"}]}"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(cfg->n_users, 1);
+    ASSERT_STR_EQ(cfg->user_names[0], "alice");
+    ASSERT_EQ(cfg->n_routes, 1);
+    ASSERT_STR_EQ(cfg->route_users[0], "alice");
+
+    /* A successful users replacement prunes authority owned by names that
+     * are no longer present. */
+    ASSERT_EQ(mqvpn_config_load_json(
+                  cfg, "{\"users\":[{\"name\":\"bob\",\"key\":\"b\"}]}"),
+              MQVPN_OK);
+    ASSERT_EQ(cfg->n_users, 1);
+    ASSERT_STR_EQ(cfg->user_names[0], "bob");
+    ASSERT_EQ(cfg->n_routes, 0);
+
+    ASSERT_EQ(mqvpn_config_load_json(
+                  cfg, "{\"routes\":[{\"user\":\"bob\","
+                       "\"prefix\":\"2001:db8::1234/64\"}]}"),
+              MQVPN_OK);
+    ASSERT_EQ(cfg->n_routes, 1);
+    ASSERT_EQ(cfg->route_prefixes[0].family, 6);
+    ASSERT_EQ(cfg->route_prefixes[0].prefix_len, 64);
+
+    mqvpn_cidr_entry_t route_prefixes_before[MQVPN_MAX_ROUTES];
+    char route_users_before[MQVPN_MAX_ROUTES][64];
+    memcpy(route_prefixes_before, cfg->route_prefixes,
+           sizeof(route_prefixes_before));
+    memcpy(route_users_before, cfg->route_users, sizeof(route_users_before));
+    int n_routes_before = cfg->n_routes;
+
+    /* A later invalid row rolls back a preceding valid row byte-for-byte. */
+    ASSERT_EQ(mqvpn_config_load_json(
+                  cfg, "{\"routes\":[{\"user\":\"bob\","
+                       "\"prefix\":\"10.10.0.0/16\"},"
+                       "{\"user\":\"bob\",\"prefix\":\"bad\"}]}"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(cfg->n_routes, n_routes_before);
+    ASSERT_EQ(memcmp(cfg->route_prefixes, route_prefixes_before,
+                     sizeof(route_prefixes_before)),
+              0);
+    ASSERT_EQ(memcmp(cfg->route_users, route_users_before,
+                     sizeof(route_users_before)),
+              0);
+
+    char user_names_before[MQVPN_MAX_USERS][64];
+    char user_keys_before[MQVPN_MAX_USERS][256];
+    char user_fixed_ips_before[MQVPN_MAX_USERS][20];
+    memcpy(user_names_before, cfg->user_names, sizeof(user_names_before));
+    memcpy(user_keys_before, cfg->user_keys, sizeof(user_keys_before));
+    memcpy(user_fixed_ips_before, cfg->user_fixed_ips,
+           sizeof(user_fixed_ips_before));
+    int n_users_before = cfg->n_users;
+
+    /* users+routes are one transaction: an invalid later route also rolls
+     * back the otherwise-valid users replacement and orphan pruning. */
+    ASSERT_EQ(mqvpn_config_load_json(
+                  cfg, "{\"users\":[{\"name\":\"alice\",\"key\":\"new\"}],"
+                       "\"routes\":[{\"user\":\"alice\","
+                       "\"prefix\":\"10.20.0.0/16\"},"
+                       "{\"user\":\"alice\",\"prefix\":\"bad\"}]}"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(cfg->n_users, n_users_before);
+    ASSERT_EQ(memcmp(cfg->user_names, user_names_before, sizeof(user_names_before)), 0);
+    ASSERT_EQ(memcmp(cfg->user_keys, user_keys_before, sizeof(user_keys_before)), 0);
+    ASSERT_EQ(memcmp(cfg->user_fixed_ips, user_fixed_ips_before,
+                     sizeof(user_fixed_ips_before)),
+              0);
+    ASSERT_EQ(cfg->n_routes, n_routes_before);
+    ASSERT_EQ(memcmp(cfg->route_prefixes, route_prefixes_before,
+                     sizeof(route_prefixes_before)),
+              0);
+    ASSERT_EQ(memcmp(cfg->route_users, route_users_before,
+                     sizeof(route_users_before)),
+              0);
+
+    ASSERT_EQ(mqvpn_config_load_json(
+                  cfg, "{\"routes\":[{\"user\":\"missing\","
+                       "\"prefix\":\"10.0.0.0/8\"}]}"),
+              MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_config_load_json(
+                  cfg, "{\"routes\":[{\"user\":\"alice\"}]}"),
+              MQVPN_ERR_INVALID_ARG);
     mqvpn_config_free(cfg);
 }
 
@@ -284,6 +461,16 @@ TEST(config_load_json_invalid_users)
 
     mqvpn_config_t *cfg = mqvpn_config_new();
     ASSERT_EQ(mqvpn_config_load_json(cfg, json), MQVPN_ERR_INVALID_ARG);
+
+    char overlong_name[65];
+    memset(overlong_name, 'x', sizeof(overlong_name) - 1);
+    overlong_name[sizeof(overlong_name) - 1] = '\0';
+    char overlong_json[160];
+    snprintf(overlong_json, sizeof(overlong_json),
+             "{\"users\":[{\"name\":\"%s\",\"key\":\"key\"}]}",
+             overlong_name);
+    ASSERT_EQ(mqvpn_config_load_json(cfg, overlong_json), MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(cfg->n_users, 0);
     mqvpn_config_free(cfg);
 }
 
@@ -2450,6 +2637,350 @@ TEST(conn_close_fires_closed_when_not_latched)
     mqvpn_client_destroy(c);
 }
 
+/* ── Native-route client source policy ──
+ *
+ * Each payload passed to the hook is one complete RFC 9484 ADDRESS_ASSIGN
+ * capsule payload: the first non-rejection address of each family is mqvpn's
+ * exact primary, later entries are routed source CIDRs, and the whole payload
+ * atomically replaces the previous source policy, except for the separately
+ * tested one-shot old-mqvpn split-initial compatibility pair. */
+
+extern int mqvpn_client_test_apply_address_assign_capsule(mqvpn_client_t *c,
+                                                          const uint8_t *payload,
+                                                          size_t payload_len);
+extern int mqvpn_client_test_source_allowed(const mqvpn_client_t *c, uint8_t family,
+                                            const uint8_t *addr);
+extern int mqvpn_client_test_allowed_src_prefix_count(const mqvpn_client_t *c);
+extern int mqvpn_client_test_conn_tunnel_ok(const mqvpn_client_t *c);
+extern int mqvpn_client_test_scan_headers(mqvpn_client_t *c, const char **names,
+                                          const char **values, int n);
+
+/* ADDRESS_ASSIGN entry with request-id varint 0 (the unsolicited assignment
+ * form used by mqvpn's server). Returns SIZE_MAX if the test buffer is too
+ * small or family is invalid. */
+static size_t
+append_address_assign_entry(uint8_t *buf, size_t cap, size_t off, uint8_t family,
+                            const uint8_t *addr, uint8_t prefix_len)
+{
+    size_t addr_len = family == 4 ? 4u : family == 6 ? 16u : 0u;
+    if (!buf || !addr || addr_len == 0 || off > cap || cap - off < addr_len + 3u)
+        return SIZE_MAX;
+    buf[off++] = 0; /* request-id = 0 */
+    buf[off++] = family;
+    memcpy(buf + off, addr, addr_len);
+    off += addr_len;
+    buf[off++] = prefix_len;
+    return off;
+}
+
+/* Small request IDs use the one-byte QUIC varint representation. */
+static size_t
+append_address_assign_response(uint8_t *buf, size_t cap, size_t off,
+                               uint8_t request_id, uint8_t family,
+                               const uint8_t *addr, uint8_t prefix_len)
+{
+    size_t addr_len = family == 4 ? 4u : family == 6 ? 16u : 0u;
+    if (!buf || !addr || request_id == 0 || request_id >= 64 || addr_len == 0 ||
+        off > cap || cap - off < addr_len + 3u)
+        return SIZE_MAX;
+    buf[off++] = request_id;
+    buf[off++] = family;
+    memcpy(buf + off, addr, addr_len);
+    off += addr_len;
+    buf[off++] = prefix_len;
+    return off;
+}
+
+TEST(address_assign_combined_snapshot_allows_primary_and_routes)
+{
+    mqvpn_client_t *c = make_test_client();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    const uint8_t primary4[4] = {10, 0, 0, 2};
+    const uint8_t other_tunnel_ip[4] = {10, 0, 0, 3};
+    const uint8_t route4[4] = {10, 111, 252, 0};
+    const uint8_t route4_host[4] = {10, 111, 255, 254};
+    const uint8_t outside4[4] = {10, 112, 0, 1};
+    const uint8_t primary6[16] = {0xfd, 0x00, 0xab, 0xcd, 0, 0, 0, 0,
+                                  0,    0,    0,    0,  0, 0, 0, 2};
+    const uint8_t route6[16] = {0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0, 0,
+                                0,    0,    0,    0,    0,    0,  0, 0};
+    const uint8_t route6_host[16] = {0x20, 0x01, 0x0d, 0xb8, 0x12, 0x34, 0, 0,
+                                     0,    0,    0,    0,    0,    0,  0, 9};
+    const uint8_t outside6[16] = {0x20, 0x01, 0x0d, 0xb8, 0x56, 0x78, 0, 0,
+                                  0,    0,    0,    0,    0,    0,  0, 9};
+
+    uint8_t payload[128];
+    size_t n = 0;
+    n = append_address_assign_entry(payload, sizeof(payload), n, 4, primary4, 32);
+    n = append_address_assign_entry(payload, sizeof(payload), n, 4, route4, 22);
+    /* Legacy compatibility: mqvpn historically sends its IPv6 primary host
+     * address with the pool prefix. Additional routed entries remain strict. */
+    n = append_address_assign_entry(payload, sizeof(payload), n, 6, primary6, 64);
+    n = append_address_assign_entry(payload, sizeof(payload), n, 6, route6, 48);
+    /* Correlated successful responses may repeat the authoritative primary
+     * after the full snapshot. Exact address+prefix replays are idempotent. */
+    n = append_address_assign_response(payload, sizeof(payload), n, 8, 4,
+                                       primary4, 32);
+    n = append_address_assign_response(payload, sizeof(payload), n, 9, 6,
+                                       primary6, 64);
+    ASSERT_NE(n, SIZE_MAX);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, payload, n), 0);
+    ASSERT_EQ(mqvpn_client_test_allowed_src_prefix_count(c), 2);
+
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, primary4), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, other_tunnel_ip), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, route4_host), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, outside4), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 6, primary6), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 6, route6_host), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 6, outside6), 0);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(address_assign_legacy_split_initial_merge_is_one_shot)
+{
+    mqvpn_client_t *c = make_test_client();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* mqvpn <= 0.16 emitted exactly these as two consecutive capsules:
+     * unsolicited singleton v4 /32, then a singleton v6 host carrying the
+     * pool prefix (non-canonical by RFC 9484). The v6 capsule must not revoke
+     * v4, otherwise cli_connect_ip_on_body cannot reach TUN readiness when
+     * both capsules are drained in one callback. */
+    const uint8_t primary4[4] = {10, 0, 0, 2};
+    const uint8_t primary6[16] = {0xfd, 0x00, 0xab, 0xcd, 0, 0, 0, 0,
+                                  0,    0,    0,    0,  0, 0, 0, 2};
+    uint8_t v4_payload[8];
+    uint8_t v6_payload[20];
+    size_t v4_len = append_address_assign_entry(v4_payload, sizeof(v4_payload), 0,
+                                                4, primary4, 32);
+    size_t v6_len = append_address_assign_entry(v6_payload, sizeof(v6_payload), 0,
+                                                6, primary6, 64);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, v4_payload,
+                                                              v4_len),
+              0);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, v6_payload,
+                                                              v6_len),
+              0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, primary4), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 6, primary6), 1);
+
+    /* The exception is consumed by that initial pair. A later v6-only
+     * snapshot keeps normal RFC replacement semantics, even if it has the
+     * same historical non-canonical shape. */
+    const uint8_t replacement6[16] = {0xfd, 0x00, 0xbe, 0xef, 0, 0, 0, 0,
+                                      0,    0,    0,    0,  0, 0, 0, 3};
+    v6_len = append_address_assign_entry(v6_payload, sizeof(v6_payload), 0, 6,
+                                         replacement6, 64);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, v6_payload,
+                                                              v6_len),
+              0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, primary4), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 6, primary6), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 6, replacement6), 1);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(address_assign_legacy_merge_does_not_capture_canonical_v6_snapshot)
+{
+    mqvpn_client_t *c = make_test_client();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    const uint8_t primary4[4] = {10, 0, 0, 2};
+    const uint8_t canonical6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 0,
+                                    0,    0,    0,    0,    0, 0, 0, 0};
+    uint8_t payload[20];
+    size_t n = append_address_assign_entry(payload, sizeof(payload), 0, 4,
+                                           primary4, 32);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, payload, n), 0);
+
+    /* A canonical singleton /64 is not the old-server fingerprint: it is a
+     * standards-compliant v6-only replacement and must revoke v4. */
+    n = append_address_assign_entry(payload, sizeof(payload), 0, 6, canonical6,
+                                    64);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, payload, n), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, primary4), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 6, canonical6), 1);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(address_assign_snapshot_replaces_omitted_routes_and_empty_revokes_all)
+{
+    mqvpn_client_t *c = make_test_client();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    const uint8_t primary[4] = {10, 0, 0, 2};
+    const uint8_t route_a[4] = {192, 0, 2, 0};
+    const uint8_t route_a_host[4] = {192, 0, 2, 44};
+    const uint8_t route_b[4] = {198, 51, 100, 0};
+    const uint8_t route_b_host[4] = {198, 51, 100, 77};
+
+    uint8_t first[64];
+    size_t n = 0;
+    n = append_address_assign_entry(first, sizeof(first), n, 4, primary, 32);
+    n = append_address_assign_entry(first, sizeof(first), n, 4, route_a, 24);
+    n = append_address_assign_entry(first, sizeof(first), n, 4, route_b, 24);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, first, n), 0);
+    ASSERT_EQ(mqvpn_client_test_allowed_src_prefix_count(c), 2);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, route_a_host), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, route_b_host), 1);
+
+    uint8_t replacement[32];
+    n = 0;
+    n = append_address_assign_entry(replacement, sizeof(replacement), n, 4, primary, 32);
+    n = append_address_assign_entry(replacement, sizeof(replacement), n, 4, route_b, 24);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, replacement, n), 0);
+    ASSERT_EQ(mqvpn_client_test_allowed_src_prefix_count(c), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, primary), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, route_a_host), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, route_b_host), 1);
+
+    /* RFC 9484: an empty ADDRESS_ASSIGN is a valid revoke-all snapshot. */
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, NULL, 0), 0);
+    ASSERT_EQ(mqvpn_client_test_allowed_src_prefix_count(c), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, primary), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, route_b_host), 0);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(address_assign_rejection_entry_is_not_source_authority)
+{
+    mqvpn_client_t *c = make_test_client();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    /* Ordering has no semantics.  Put the rejection first so ::/128 cannot
+     * accidentally become the snapshot's IPv6 primary assignment. */
+    const uint8_t rejected6[16] = {0};
+    const uint8_t primary4[4] = {10, 0, 0, 2};
+    const uint8_t route4[4] = {198, 51, 100, 0};
+    const uint8_t route4_host[4] = {198, 51, 100, 9};
+    uint8_t payload[64];
+    size_t n = 0;
+    n = append_address_assign_response(payload, sizeof(payload), n, 7, 6,
+                                       rejected6, 128);
+    n = append_address_assign_entry(payload, sizeof(payload), n, 4, primary4, 32);
+    n = append_address_assign_entry(payload, sizeof(payload), n, 4, route4, 24);
+    ASSERT_NE(n, SIZE_MAX);
+
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, payload, n), 0);
+    ASSERT_EQ(mqvpn_client_test_allowed_src_prefix_count(c), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 6, rejected6), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, primary4), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, route4_host), 1);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(address_assign_invalid_snapshot_rolls_back_atomically)
+{
+    mqvpn_client_t *c = make_test_client();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    const uint8_t primary[4] = {10, 0, 0, 2};
+    const uint8_t old_route[4] = {198, 51, 100, 0};
+    const uint8_t old_host[4] = {198, 51, 100, 7};
+    uint8_t initial[32];
+    size_t n = 0;
+    n = append_address_assign_entry(initial, sizeof(initial), n, 4, primary, 32);
+    n = append_address_assign_entry(initial, sizeof(initial), n, 4, old_route, 24);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, initial, n), 0);
+    const char *status_names[] = {":status"};
+    const char *status_values[] = {"200"};
+    ASSERT_EQ(mqvpn_client_test_scan_headers(c, status_names, status_values, 1), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_ok(c), 1);
+
+    /* A valid new prefix followed by a truncated entry must not partially
+     * replace the already committed policy. */
+    const uint8_t new_route[4] = {203, 0, 113, 0};
+    const uint8_t new_host[4] = {203, 0, 113, 9};
+    uint8_t malformed[32];
+    n = 0;
+    n = append_address_assign_entry(malformed, sizeof(malformed), n, 4, primary, 32);
+    n = append_address_assign_entry(malformed, sizeof(malformed), n, 4, new_route, 24);
+    malformed[n++] = 0; /* truncated next request-id-only entry */
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, malformed, n), -1);
+    ASSERT_EQ(mqvpn_client_test_conn_tunnel_ok(c), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, old_host), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, new_host), 0);
+
+    /* Same primary address with a different prefix is contradictory, not an
+     * idempotent replay. */
+    uint8_t conflicting[24];
+    n = 0;
+    n = append_address_assign_entry(conflicting, sizeof(conflicting), n, 4, primary, 32);
+    n = append_address_assign_entry(conflicting, sizeof(conflicting), n, 4, primary, 0);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, conflicting, n), -1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, old_host), 1);
+
+    /* Routed entries must be canonical on the wire; host bits are not silently
+     * normalized into broader source authority. */
+    const uint8_t noncanonical[4] = {192, 0, 2, 7};
+    uint8_t bad_prefix[24];
+    n = 0;
+    n = append_address_assign_entry(bad_prefix, sizeof(bad_prefix), n, 4, primary, 32);
+    n = append_address_assign_entry(bad_prefix, sizeof(bad_prefix), n, 4,
+                                    noncanonical, 24);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, bad_prefix, n), -1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, old_host), 1);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
+TEST(address_assign_route_cap_is_atomic_and_reconnect_resets)
+{
+    mqvpn_client_t *c = make_test_client();
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+
+    const uint8_t primary[4] = {192, 0, 2, 1};
+    const size_t cap = (size_t)(MQVPN_MAX_ROUTES + 3) * 7u;
+    uint8_t *payload = malloc(cap);
+    ASSERT_NOT_NULL(payload);
+    size_t n = append_address_assign_entry(payload, cap, 0, 4, primary, 32);
+    uint8_t route[4] = {10, 0, 0, 1};
+    for (int i = 0; i < MQVPN_MAX_ROUTES; i++) {
+        route[1] = (uint8_t)(i >> 8);
+        route[2] = (uint8_t)i;
+        n = append_address_assign_entry(payload, cap, n, 4, route, 32);
+    }
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, payload, n), 0);
+    ASSERT_EQ(mqvpn_client_test_allowed_src_prefix_count(c), MQVPN_MAX_ROUTES);
+
+    /* Duplicate remains valid at capacity. */
+    n = append_address_assign_entry(payload, cap, n, 4, route, 32);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, payload, n), 0);
+    ASSERT_EQ(mqvpn_client_test_allowed_src_prefix_count(c), MQVPN_MAX_ROUTES);
+
+    /* One new route exceeds the cap; the prior full snapshot remains active. */
+    const uint8_t overflow[4] = {203, 0, 113, 9};
+    n = append_address_assign_entry(payload, cap, n, 4, overflow, 32);
+    ASSERT_EQ(mqvpn_client_test_apply_address_assign_capsule(c, payload, n), -2);
+    ASSERT_EQ(mqvpn_client_test_allowed_src_prefix_count(c), MQVPN_MAX_ROUTES);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, primary), 1);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, overflow), 0);
+    free(payload);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+
+    /* New per-connection calloc must not inherit the old snapshot. */
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+    ASSERT_EQ(mqvpn_client_test_allowed_src_prefix_count(c), 0);
+    ASSERT_EQ(mqvpn_client_test_source_allowed(c, 4, primary), 0);
+
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
 /* ── CONNECT-IP :status scan hardening + close classification (v0.13.0
  *    pre-release review findings) ──
  *
@@ -2460,10 +2991,7 @@ TEST(conn_close_fires_closed_when_not_latched)
  * failures. A locally initiated shutdown must keep reporting
  * MQVPN_ERR_CLOSED, not a spurious PROTOCOL connect-fail. */
 
-extern int mqvpn_client_test_conn_tunnel_ok(const mqvpn_client_t *c);
 extern int mqvpn_client_test_set_shutting_down(mqvpn_client_t *c, int v);
-extern int mqvpn_client_test_scan_headers(mqvpn_client_t *c, const char **names,
-                                          const char **values, int n);
 extern int mqvpn_client_test_conn_peer_reorder(const mqvpn_client_t *c);
 
 /* All-":status" convenience wrapper over the (name, value) scan hook. */
@@ -3330,6 +3858,9 @@ main(void)
     run_config_set_server();
     run_config_set_auth_key();
     run_config_add_remove_user();
+    run_config_add_route_and_user_cascade();
+    run_config_add_route_capacity();
+    run_config_load_json_routes_replace();
     run_config_set_user_fixed_ip();
     run_config_load_json_user_with_fixed_ip();
     run_config_add_user_max_capacity();
@@ -3471,6 +4002,13 @@ main(void)
     run_connect_fail_signals_tunnel_closed_exactly_once();
     run_conn_close_skips_closed_after_connect_fail();
     run_conn_close_fires_closed_when_not_latched();
+    run_address_assign_combined_snapshot_allows_primary_and_routes();
+    run_address_assign_legacy_split_initial_merge_is_one_shot();
+    run_address_assign_legacy_merge_does_not_capture_canonical_v6_snapshot();
+    run_address_assign_snapshot_replaces_omitted_routes_and_empty_revokes_all();
+    run_address_assign_rejection_entry_is_not_source_authority();
+    run_address_assign_invalid_snapshot_rolls_back_atomically();
+    run_address_assign_route_cap_is_atomic_and_reconnect_resets();
 
     /* CONNECT-IP :status scan hardening + close classification */
     run_headers_duplicate_status_first_final_wins();
