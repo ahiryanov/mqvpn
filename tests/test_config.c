@@ -110,6 +110,7 @@ test_defaults(void)
     ASSERT_EQ_STR(cfg.server_addr, "", "default server_addr");
     ASSERT_EQ_STR(cfg.auth_key, "", "default auth_key");
     ASSERT_EQ_STR(cfg.server_auth_key, "", "default server_auth_key");
+    ASSERT_EQ_INT(cfg.n_routes, 0, "default n_routes");
 }
 
 static void
@@ -1386,6 +1387,219 @@ test_json_users_escaped_quote_in_value(void)
     ASSERT_EQ_INT(cfg.n_users, 1, "json users escaped-quote count");
     ASSERT_EQ_STR(cfg.user_names[0], "dave", "json users escaped-quote name");
     ASSERT_EQ_STR(cfg.user_keys[0], "k\"2", "json users escaped-quote key");
+}
+
+static void
+test_routes_ini_parse_and_forward_owner(void)
+{
+    /* Route may precede Auth: owner validation is a whole-file pass. The
+     * second row normalizes to the first and is therefore idempotent. */
+    const char *ini = "[Route]\n"
+                      "User = alice\n"
+                      "Prefix = 10.1.2.3/16\n"
+                      "[Auth]\n"
+                      "User = alice:alice-key\n"
+                      "User = bob:bob-key\n"
+                      "[Route]\n"
+                      "User = alice\n"
+                      "Prefix = 10.1.99.1/16\n"
+                      "[Route]\n"
+                      "User = bob\n"
+                      "Prefix = 10.1.8.0/24\n";
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+
+    ASSERT_EQ_INT(rc, 0, "INI routes parse");
+    ASSERT_EQ_INT(cfg.n_routes, 2, "canonical duplicate route idempotent");
+    ASSERT_EQ_STR(cfg.routes[0].user, "alice", "route[0] user");
+    ASSERT_EQ_STR(cfg.routes[0].prefix, "10.1.2.3/16", "route[0] source spelling");
+    ASSERT_EQ_STR(cfg.routes[1].user, "bob", "nested overlap owner");
+    ASSERT_EQ_STR(cfg.routes[1].prefix, "10.1.8.0/24", "nested overlap prefix");
+}
+
+static void
+test_routes_ini_invalid_hard_errors(void)
+{
+    const char *cases[] = {
+        "[Auth]\nUser = alice:key\n[Route]\nUser = alice\n", /* incomplete */
+        "[Auth]\nUser = alice:key\n[Route]\nUser = alice\nPrefix = bad\n",
+        "[Auth]\nUser = alice:key\n[Route]\nUser = missing\nPrefix = 10.0.0.0/8\n",
+        "[Auth]\nUser = alice:key\nUser = bob:key2\n"
+        "[Route]\nUser = alice\nPrefix = 10.1.2.3/16\n"
+        "[Route]\nUser = bob\nPrefix = 10.1.9.9/16\n",
+        "[Auth]\nUser = alice:key\n[Route]\nUser = alice\nUser = alice\n"
+        "Prefix = 10.0.0.0/8\n",
+        "[Auth]\nUser = (global):named-key\n[Route]\nUser = (global)\n"
+        "Prefix = 10.0.0.0/8\n",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *path = write_tmp(cases[i]);
+        mqvpn_file_config_t cfg;
+        mqvpn_config_defaults(&cfg);
+        int rc = mqvpn_config_load(&cfg, path);
+        unlink(path);
+        ASSERT_TRUE(rc != 0, "invalid INI route is hard error");
+    }
+}
+
+static void
+test_routes_json_parse_replace_and_errors(void)
+{
+    /* Textual key order is intentionally routes-before-users. */
+    const char *json = "{\"routes\":["
+                       "{\"user\":\"alice\",\"prefix\":\"2001:db8:1:1::1/64\"},"
+                       "{\"user\":\"alice\",\"prefix\":\"2001:db8:1:1::abcd/64\"},"
+                       "{\"user\":\"bob\",\"prefix\":\"2001:db8:1:1:abcd::/80\"}],"
+                       "\"users\":[{\"name\":\"alice\",\"key\":\"a\"},"
+                       "{\"name\":\"bob\",\"key\":\"b\"}]}";
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    ASSERT_EQ_INT(mqvpn_config_load_json_filecfg(&cfg, json), 0,
+                  "JSON routes parse");
+    ASSERT_EQ_INT(cfg.n_routes, 2, "JSON canonical duplicate idempotent");
+    ASSERT_EQ_STR(cfg.routes[1].user, "bob", "JSON nested overlap owner");
+
+    /* Malformed replacement is atomic even after accepting an earlier row. */
+    ASSERT_TRUE(mqvpn_config_load_json_filecfg(
+                    &cfg, "{\"users\":[{\"name\":\"bob\",\"key\":\"b2\"},"
+                          "{\"name\":\"broken\"}]}") != 0,
+                "malformed users replacement fails");
+    ASSERT_EQ_INT(cfg.n_users, 2, "failed users replacement preserves users");
+    ASSERT_EQ_STR(cfg.user_names[0], "alice", "failed replacement old user");
+    ASSERT_EQ_INT(cfg.n_routes, 2, "failed users replacement preserves routes");
+
+    /* Valid replacement retains only authority owned by surviving names. */
+    ASSERT_EQ_INT(mqvpn_config_load_json_filecfg(
+                      &cfg, "{\"users\":[{\"name\":\"bob\",\"key\":\"b2\"}]}"),
+                  0, "JSON users replacement");
+    ASSERT_EQ_INT(cfg.n_users, 1, "JSON users replacement count");
+    ASSERT_EQ_STR(cfg.user_names[0], "bob", "JSON users replacement owner");
+    ASSERT_EQ_INT(cfg.n_routes, 1, "orphan route pruned");
+    ASSERT_EQ_STR(cfg.routes[0].user, "bob", "surviving route retained");
+
+    ASSERT_EQ_INT(mqvpn_config_load_json_filecfg(
+                      &cfg, "{\"routes\":[{\"user\":\"bob\","
+                            "\"prefix\":\"10.9.0.0/16\"}]}"),
+                  0, "JSON routes replace");
+    ASSERT_EQ_INT(cfg.n_routes, 1, "JSON routes replace stale rows");
+    ASSERT_EQ_STR(cfg.routes[0].prefix, "10.9.0.0/16", "replacement route");
+
+    mqvpn_route_config_t routes_before[MQVPN_CONFIG_MAX_ROUTES];
+    memcpy(routes_before, cfg.routes, sizeof(routes_before));
+    int n_routes_before = cfg.n_routes;
+
+    ASSERT_TRUE(mqvpn_config_load_json_filecfg(
+                    &cfg, "{\"routes\":[{\"user\":\"bob\","
+                          "\"prefix\":\"10.10.0.0/16\"},"
+                          "{\"user\":\"bob\",\"prefix\":\"bad\"}]}") != 0,
+                "invalid later route rolls back replacement");
+    ASSERT_EQ_INT(cfg.n_routes, n_routes_before, "route rollback count");
+    ASSERT_TRUE(memcmp(cfg.routes, routes_before, sizeof(routes_before)) == 0,
+                "route rollback is byte-for-byte");
+
+    char user_names_before[MQVPN_CONFIG_MAX_USERS][64];
+    char user_keys_before[MQVPN_CONFIG_MAX_USERS][256];
+    char user_fixed_ips_before[MQVPN_CONFIG_MAX_USERS][20];
+    memcpy(user_names_before, cfg.user_names, sizeof(user_names_before));
+    memcpy(user_keys_before, cfg.user_keys, sizeof(user_keys_before));
+    memcpy(user_fixed_ips_before, cfg.user_fixed_ips,
+           sizeof(user_fixed_ips_before));
+    int n_users_before = cfg.n_users;
+
+    ASSERT_TRUE(mqvpn_config_load_json_filecfg(
+                    &cfg, "{\"users\":[{\"name\":\"alice\",\"key\":\"new\"}],"
+                          "\"routes\":[{\"user\":\"alice\","
+                          "\"prefix\":\"10.20.0.0/16\"},"
+                          "{\"user\":\"alice\",\"prefix\":\"bad\"}]}") != 0,
+                "combined users/routes rollback");
+    ASSERT_EQ_INT(cfg.n_users, n_users_before, "combined rollback user count");
+    ASSERT_TRUE(memcmp(cfg.user_names, user_names_before,
+                       sizeof(user_names_before)) == 0,
+                "combined rollback user names");
+    ASSERT_TRUE(memcmp(cfg.user_keys, user_keys_before,
+                       sizeof(user_keys_before)) == 0,
+                "combined rollback user keys");
+    ASSERT_TRUE(memcmp(cfg.user_fixed_ips, user_fixed_ips_before,
+                       sizeof(user_fixed_ips_before)) == 0,
+                "combined rollback fixed IPs");
+    ASSERT_EQ_INT(cfg.n_routes, n_routes_before, "combined rollback route count");
+    ASSERT_TRUE(memcmp(cfg.routes, routes_before, sizeof(routes_before)) == 0,
+                "combined rollback routes byte-for-byte");
+
+    const char *bad[] = {
+        "{\"routes\":[{\"user\":\"alice\"}]}",
+        "{\"routes\":[{\"user\":\"alice\",\"prefix\":\"bad\"}]}",
+        "{\"routes\":[{\"user\":\"missing\",\"prefix\":\"10.0.0.0/8\"}]}",
+        "{\"users\":[{\"name\":\"alice\",\"key\":\"a\"},"
+        "{\"name\":\"bob\",\"key\":\"b\"}],"
+        "\"routes\":[{\"user\":\"alice\",\"prefix\":\"10.1.2.3/16\"},"
+        "{\"user\":\"bob\",\"prefix\":\"10.1.9.9/16\"}]}",
+        "{\"users\":[{\"name\":\"(global)\",\"key\":\"named\"}],"
+        "\"routes\":[{\"user\":\"(global)\",\"prefix\":\"10.0.0.0/8\"}]}",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        ASSERT_TRUE(mqvpn_config_load_json_filecfg(&cfg, bad[i]) != 0,
+                    "invalid JSON route is hard error");
+}
+
+static void
+test_user_name_length_is_strict(void)
+{
+    char max_name[64];
+    memset(max_name, 'm', sizeof(max_name) - 1);
+    max_name[sizeof(max_name) - 1] = '\0';
+    char overlong_name[65];
+    memset(overlong_name, 'x', sizeof(overlong_name) - 1);
+    overlong_name[sizeof(overlong_name) - 1] = '\0';
+
+    char ini[256];
+    snprintf(ini, sizeof(ini), "[Auth]\nUser = %s:key\nUser = %s:key\n",
+             max_name, overlong_name);
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    ASSERT_EQ_INT(mqvpn_config_load(&cfg, path), 0,
+                  "overlong INI username is rejected without truncation");
+    unlink(path);
+    ASSERT_EQ_INT(cfg.n_users, 1, "only max-length INI username accepted");
+    ASSERT_EQ_STR(cfg.user_names[0], max_name, "63-byte username retained exactly");
+
+    char json[192];
+    snprintf(json, sizeof(json),
+             "{\"users\":[{\"name\":\"%s\",\"key\":\"key\"}]}",
+             overlong_name);
+    mqvpn_config_defaults(&cfg);
+    ASSERT_TRUE(mqvpn_config_load_json_filecfg(&cfg, json) != 0,
+                "overlong JSON object username is hard error");
+    ASSERT_EQ_INT(cfg.n_users, 0, "overlong JSON username never truncates");
+
+    snprintf(json, sizeof(json), "{\"users\":[\"%s:key\"]}", overlong_name);
+    ASSERT_TRUE(mqvpn_config_load_json_filecfg(&cfg, json) != 0,
+                "overlong JSON string username is hard error");
+    ASSERT_EQ_INT(cfg.n_users, 0, "overlong JSON string username never truncates");
+}
+
+static void
+test_routes_ini_cap_hard_error(void)
+{
+    size_t cap = 128 + (size_t)(MQVPN_CONFIG_MAX_ROUTES + 1) * 80;
+    char *ini = malloc(cap);
+    ASSERT_TRUE(ini != NULL, "route cap test allocation");
+    if (!ini) return;
+    size_t pos = (size_t)snprintf(ini, cap, "[Auth]\nUser = alice:key\n");
+    for (int i = 0; i <= MQVPN_CONFIG_MAX_ROUTES; i++)
+        pos += (size_t)snprintf(ini + pos, cap - pos,
+                                "[Route]\nUser = alice\nPrefix = 2001:db8:%x::/48\n", i);
+    char *path = write_tmp(ini);
+    mqvpn_file_config_t cfg;
+    mqvpn_config_defaults(&cfg);
+    int rc = mqvpn_config_load(&cfg, path);
+    unlink(path);
+    free(ini);
+    ASSERT_TRUE(rc != 0, "route cap overflow is hard error");
 }
 
 /* ================================================================
@@ -2869,6 +3083,11 @@ main(void)
     test_json_invalid_users_error();
     test_json_users_brace_in_string_value();
     test_json_users_escaped_quote_in_value();
+    test_routes_ini_parse_and_forward_owner();
+    test_routes_ini_invalid_hard_errors();
+    test_routes_json_parse_replace_and_errors();
+    test_routes_ini_cap_hard_error();
+    test_user_name_length_is_strict();
 
     /* route_via_server tests */
     test_route_via_server_default_off();

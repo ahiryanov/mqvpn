@@ -22,10 +22,13 @@
 #define MQVPN_CONFIG_MAX_PATHS 8
 #define MQVPN_CONFIG_MAX_DNS   4
 #define MQVPN_CONFIG_MAX_USERS 64
+#define MQVPN_CONFIG_MAX_ROUTES MQVPN_MAX_ROUTES
 _Static_assert(MQVPN_CONFIG_MAX_PATHS == MQVPN_MAX_PATHS,
                "Config path cap must equal library cap (libmqvpn.h)");
 _Static_assert(MQVPN_CONFIG_MAX_USERS == MQVPN_MAX_USERS,
                "Config user cap must equal library cap (libmqvpn.h)");
+_Static_assert(MQVPN_CONFIG_MAX_ROUTES == MQVPN_MAX_ROUTES,
+               "Config route cap must equal library cap (libmqvpn.h)");
 
 /* [Multipath] — persisted per-(user,iface) downlink weight/dscp_mask
  * overrides, JSON-only (array of objects; no INI equivalent yet, same as
@@ -42,6 +45,20 @@ typedef struct {
     int      has_dscp_mask;
     uint64_t dscp_mask;
 } mqvpn_path_policy_t;
+
+typedef struct {
+    char user[64];
+    /* Full IPv6 literal plus /128 fits in INET6_ADDRSTRLEN+4; keep modest
+     * slack without pulling platform socket headers into this public parser
+     * struct. Canonicalization happens in mqvpn_config_add_route(). */
+    char prefix[56];
+    /* INI parser bookkeeping; ignored by the platform bridge. Keeping it
+     * with the pending row lets handle_kv() retain its existing void API while
+     * still making duplicate/invalid fields a hard load error at section end. */
+    int has_user;
+    int has_prefix;
+    int invalid;
+} mqvpn_route_config_t;
 
 typedef struct mqvpn_file_config_s {
     /* [Interface] — common */
@@ -78,6 +95,12 @@ typedef struct mqvpn_file_config_s {
     char user_fixed_ips[MQVPN_CONFIG_MAX_USERS][20]; /* "" = dynamic, "x.x.x.x" = pinned */
     int n_users;
     int max_clients;
+
+    /* Repeated [Route] / JSON "routes" entries. The file layer retains the
+     * string so the platform bridge can feed the single canonical public
+     * builder implementation. */
+    mqvpn_route_config_t routes[MQVPN_CONFIG_MAX_ROUTES];
+    int n_routes;
 
     /* [Control] — server */
     char control_listen[280]; /* "addr:port" — empty string when control API disabled */

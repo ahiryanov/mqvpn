@@ -101,10 +101,15 @@ static int g_cli_fd = -1;
 static xqc_engine_t *g_cli_engine = NULL;
 static xqc_cid_t g_cli_cid;
 static int g_handshake_finished = 0;
+static int g_routed_mode = 0;
+static int g_invalid_auth = 0;
 
 typedef struct {
     int status; /* :status captured from the response, -1 = not yet seen */
     int closed; /* h3_request_close_notify fired */
+    int address_assigns;
+    uint8_t capsules[4096];
+    size_t capsule_len;
 } cli_req_ctx_t;
 
 static cli_req_ctx_t g_req1 = {.status = -1};
@@ -259,7 +264,7 @@ cli_send_connect_ip(xqc_h3_request_t *req, int svr_port)
     char authority[64];
     snprintf(authority, sizeof(authority), "127.0.0.1:%d", svr_port);
 
-    xqc_http_header_t hdrs[6] = {
+    xqc_http_header_t hdrs[7] = {
         {.name = {.iov_base = ":method", .iov_len = 7},
          .value = {.iov_base = "CONNECT", .iov_len = 7},
          .flags = 0},
@@ -279,12 +284,33 @@ cli_send_connect_ip(xqc_h3_request_t *req, int svr_port)
          .value = {.iov_base = "?1", .iov_len = 2},
          .flags = 0},
     };
-    xqc_http_headers_t headers = {.headers = hdrs, .count = 6, .capacity = 6};
+    if (g_routed_mode) {
+        hdrs[6] = (xqc_http_header_t){
+            .name = {.iov_base = "authorization", .iov_len = 13},
+            .value = {.iov_base = g_invalid_auth ? "Bearer wrong-key" : "Bearer alice-key",
+                      .iov_len = 16},
+        };
+    }
+    xqc_http_headers_t headers = {
+        .headers = hdrs, .count = g_routed_mode ? 7 : 6, .capacity = 7};
 
     /* fin=0: a real connect-ip tunnel keeps the stream open for capsules
      * (and would carry DATAGRAMs); the rejected duplicate never gets a
      * chance to send a body either way. */
-    return xqc_h3_request_send_headers(req, &headers, 0) < 0 ? -1 : 0;
+    if (xqc_h3_request_send_headers(req, &headers, 0) < 0) return -1;
+    if (g_routed_mode) {
+        /* Request ID 7 is legal again on a NEW CONNECT-IP stream. The server
+         * must discard the previous stream's ID history at session release. */
+        const uint8_t request[] = {7, 4, 0, 0, 0, 0, 0};
+        uint8_t capsule[32];
+        size_t n = 0;
+        if (xqc_h3_ext_capsule_encode(capsule, sizeof(capsule), &n,
+                                      XQC_H3_CAPSULE_ADDRESS_REQUEST,
+                                      request, sizeof(request)) != XQC_OK ||
+            xqc_h3_request_send_body(req, capsule, n, 0) != (ssize_t)n)
+            return -1;
+    }
+    return 0;
 }
 
 static int
@@ -328,7 +354,24 @@ cli_h3_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag
          * capsules to make progress. */
         unsigned char drain[4096];
         unsigned char fin = 0;
-        while (xqc_h3_request_recv_body(h3_request, drain, sizeof(drain), &fin) > 0) {}
+        ssize_t n;
+        while ((n = xqc_h3_request_recv_body(h3_request, drain, sizeof(drain), &fin)) > 0) {
+            if (!ctx || (size_t)n > sizeof(ctx->capsules) - ctx->capsule_len) return -1;
+            memcpy(ctx->capsules + ctx->capsule_len, drain, (size_t)n);
+            ctx->capsule_len += (size_t)n;
+            while (ctx->capsule_len) {
+                uint64_t type;
+                const uint8_t *payload;
+                size_t len, consumed;
+                if (xqc_h3_ext_capsule_decode(ctx->capsules, ctx->capsule_len,
+                                               &type, &payload, &len, &consumed) != XQC_OK)
+                    break;
+                if (type == XQC_H3_CAPSULE_ADDRESS_ASSIGN) ctx->address_assigns++;
+                memmove(ctx->capsules, ctx->capsules + consumed,
+                        ctx->capsule_len - consumed);
+                ctx->capsule_len -= consumed;
+            }
+        }
     }
 
     return 0;
@@ -507,8 +550,9 @@ pump_until(mqvpn_server_t *svr, int svr_fd, struct sockaddr_in *cli_addr, int cl
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+    g_routed_mode = argc == 2 && strcmp(argv[1], "--routes") == 0;
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     printf("test_server_double_connectip: duplicate CONNECT-IP regression\n");
@@ -532,6 +576,12 @@ main(void)
     mqvpn_config_set_subnet(cfg, "10.0.0.0/24");
     mqvpn_config_set_tls_cert(cfg, TEST_CERT_FILE, TEST_KEY_FILE);
     mqvpn_config_set_log_level(cfg, MQVPN_LOG_ERROR);
+    if (g_routed_mode &&
+        (mqvpn_config_add_user(cfg, "alice", "alice-key") != MQVPN_OK ||
+         mqvpn_config_add_route(cfg, "alice", "10.50.0.0/16") != MQVPN_OK)) {
+        fprintf(stderr, "FAIL: routed config\n");
+        return 1;
+    }
 
     mqvpn_server_callbacks_t cbs = MQVPN_SERVER_CALLBACKS_INIT;
     cbs.tun_output = svr_tun_output;
@@ -648,6 +698,22 @@ main(void)
      * request #1. */
     pump_wait(svr, svr_fd, &cli_addr, cli_fd, 2000, &g_handshake_finished);
 
+    /* Keep a rejected request open until AFTER the real tunnel establishes.
+     * Closing that older request must not clear the new tunnel's handle. */
+    xqc_h3_request_t *rejected = NULL;
+    cli_req_ctx_t rejected_ctx = {.status = -1};
+    if (g_routed_mode && g_handshake_finished) {
+        rejected = xqc_h3_request_create(g_cli_engine, &g_cli_cid, NULL, &rejected_ctx);
+        g_invalid_auth = 1;
+        if (!rejected || cli_send_connect_ip(rejected, ntohs(svr_addr.sin_port)) != 0)
+            rc = 1;
+        g_invalid_auth = 0;
+        pump_cond_ctx_t rejected_cond = {
+            .svr = svr, .min_clients = -1, .eq_clients = -1, .req = &rejected_ctx};
+        pump_until(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &rejected_cond);
+        if (rejected_ctx.status != 403) rc = 1;
+    }
+
     xqc_h3_request_t *req1 = NULL;
     /* Captured immediately after creation, before req1 is ever closed — the
      * qsid-fence phase (§10) needs this stream id after req1's stream (and
@@ -679,8 +745,8 @@ main(void)
             .min_clients = 1,
             .eq_clients = -1,
             .req = &g_req1,
-            .counter = NULL,
-            .counter_target = 0,
+            .counter = g_routed_mode ? &g_req1.address_assigns : NULL,
+            .counter_target = 2,
         };
         pump_until(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &est1_cond);
 
@@ -690,10 +756,15 @@ main(void)
                 "on_client_connected_calls=%d\n",
                 n_after_first, g_req1.status, g_assigned_ip[0], g_assigned_ip[1],
                 g_assigned_ip[2], g_assigned_ip[3], g_client_connected_calls);
-        if (n_after_first != 1) {
+        if (n_after_first != 1 || (g_routed_mode && g_req1.address_assigns != 2)) {
             printf("  first CONNECT-IP did not establish exactly one session   FAIL\n");
             rc = 1;
         }
+    }
+
+    if (rejected && !rejected_ctx.closed) {
+        xqc_h3_request_close(rejected);
+        pump_wait(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &rejected_ctx.closed);
     }
 
     if (rc == 0) {
@@ -828,8 +899,8 @@ main(void)
             .min_clients = 1,
             .eq_clients = -1,
             .req = &g_req3,
-            .counter = NULL,
-            .counter_target = 0,
+            .counter = g_routed_mode ? &g_req3.address_assigns : NULL,
+            .counter_target = 2,
         };
         pump_until(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &reest_cond);
 
@@ -839,7 +910,8 @@ main(void)
                 "assigned_ip2=%d.%d.%d.%d\n",
                 n_after_reest, g_req3.status, g_client_connected_calls, g_assigned_ip2[0],
                 g_assigned_ip2[1], g_assigned_ip2[2], g_assigned_ip2[3]);
-        if (g_req3.status == 200 && n_after_reest == 1 && g_client_connected_calls == 2) {
+        if (g_req3.status == 200 && n_after_reest == 1 && g_client_connected_calls == 2 &&
+            (!g_routed_mode || g_req3.address_assigns == 2)) {
             printf("  re-establishment: req3=200, n_clients=1, connected_calls=2     "
                    "PASS\n");
         } else {
@@ -868,8 +940,11 @@ main(void)
         inner_pkt[8] = 64;   /* TTL > 1, so forward_inner_ip forwards rather
                               * than ICMP Time-Exceeded-ing it. */
         inner_pkt[9] = 17;   /* UDP */
-        memcpy(inner_pkt + 12, g_assigned_ip2, 4); /* source: second tunnel's IP
-                                                    * (anti-spoof) */
+        memcpy(inner_pkt + 12, g_assigned_ip2, 4);
+        if (g_routed_mode) {
+            const uint8_t lan_source[4] = {10, 50, 9, 1};
+            memcpy(inner_pkt + 12, lan_source, sizeof(lan_source));
+        }
         /* Distinguishable destinations: stale-generation copy goes to
          * 8.8.8.8, live-generation copy to 8.8.8.9. tun_output records the
          * delivered destination, so the assertion below can require that

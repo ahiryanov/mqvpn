@@ -143,6 +143,16 @@ struct cli_conn_s {
     int addr6_assigned;
     uint8_t assigned_ip6[16];
     uint8_t assigned_prefix6;
+    /* Additional source prefixes granted by ADDRESS_ASSIGN.  The first
+     * assignment for each family remains the primary address above (and is
+     * always checked exactly); later entries must already be canonical and
+     * are stored here.  This state is connection-scoped so reconnect starts
+     * closed. */
+    mqvpn_cidr_entry_t allowed_src_prefixes[MQVPN_MAX_ROUTES];
+    int n_allowed_src_prefixes;
+    /* One-shot compatibility detector for old mqvpn dual-stack servers,
+     * which sent the initial v4 and v6 assignments in separate capsules. */
+    uint8_t legacy_initial_address_state;
     uint64_t dgram_lost_cnt;
     uint64_t dgram_acked_cnt;
 
@@ -1779,7 +1789,396 @@ stream_append_capsules(cli_stream_t *s, const uint8_t *buf, size_t len)
     return 0;
 }
 
+enum {
+    CLI_ADDRESS_ASSIGN_OK = 0,
+    CLI_ADDRESS_ASSIGN_INVALID = -1,
+    CLI_ADDRESS_ASSIGN_CAPACITY = -2,
+    CLI_ADDRESS_ASSIGN_NOMEM = -3,
+};
+
+enum {
+    CLI_LEGACY_ADDRESS_UNUSED = 0,
+    CLI_LEGACY_ADDRESS_V4_PENDING,
+    CLI_LEGACY_ADDRESS_DISARMED,
+};
+
+/* One complete ADDRESS_ASSIGN policy snapshot.  RFC 9484 §4.7.1 makes each
+ * capsule a full replacement (including a valid empty "revoke all" capsule),
+ * so parsing directly into cli_conn_t would expose a partially granted source
+ * policy if a later entry were malformed.  Build this detached snapshot first
+ * and commit it only after the entire capsule validates.  The installer below
+ * has one separately fingerprinted merge for old mqvpn's initial split pair. */
+typedef struct {
+    int addr_assigned;
+    uint8_t assigned_ip[4];
+    uint8_t assigned_prefix;
+    int addr6_assigned;
+    uint8_t assigned_ip6[16];
+    uint8_t assigned_prefix6;
+    mqvpn_cidr_entry_t allowed_src_prefixes[MQVPN_MAX_ROUTES];
+    int n_allowed_src_prefixes;
+    size_t wire_entry_count;
+    uint64_t sole_request_id;
+} cli_address_policy_t;
+
+/* The first entry for a family remains mqvpn's primary tunnel address
+ * convention.  Existing mqvpn IPv6 servers historically send that host
+ * address with the pool prefix, so primary entries deliberately retain that
+ * compatibility exception.  Additional entries are routed prefixes and MUST
+ * already have zero host bits on the wire (RFC 9484 §4.7.1); silently
+ * premasking a malformed entry could turn it into broader source authority. */
+static int
+cli_address_policy_add(cli_address_policy_t *policy, uint8_t family,
+                       const uint8_t *addr, size_t addr_len, uint8_t prefix_len)
+{
+    if (!policy || !addr) return CLI_ADDRESS_ASSIGN_INVALID;
+
+    size_t expected_len;
+    uint8_t max_prefix;
+    int *primary_set;
+    uint8_t *primary_addr;
+    uint8_t *primary_prefix;
+
+    if (family == 4) {
+        expected_len = 4;
+        max_prefix = 32;
+        primary_set = &policy->addr_assigned;
+        primary_addr = policy->assigned_ip;
+        primary_prefix = &policy->assigned_prefix;
+    } else if (family == 6) {
+        expected_len = 16;
+        max_prefix = 128;
+        primary_set = &policy->addr6_assigned;
+        primary_addr = policy->assigned_ip6;
+        primary_prefix = &policy->assigned_prefix6;
+    } else {
+        return CLI_ADDRESS_ASSIGN_INVALID;
+    }
+    if (addr_len != expected_len || prefix_len > max_prefix)
+        return CLI_ADDRESS_ASSIGN_INVALID;
+
+    if (!*primary_set) {
+        memcpy(primary_addr, addr, expected_len);
+        *primary_prefix = prefix_len;
+        *primary_set = 1;
+        return CLI_ADDRESS_ASSIGN_OK;
+    }
+
+    /* Only an exact address+prefix replay is idempotent.  The same address
+     * with a different prefix is contradictory wire state, not a replay. */
+    if (memcmp(primary_addr, addr, expected_len) == 0) {
+        return *primary_prefix == prefix_len ? CLI_ADDRESS_ASSIGN_OK
+                                             : CLI_ADDRESS_ASSIGN_INVALID;
+    }
+
+    mqvpn_cidr_entry_t entry = {0};
+    entry.family = family;
+    entry.prefix_len = prefix_len;
+    memcpy(entry.net, addr, expected_len);
+
+    uint8_t canonical[16] = {0};
+    memcpy(canonical, addr, expected_len);
+    mqvpn_cidr_premask(canonical, prefix_len);
+    if (memcmp(canonical, entry.net, sizeof(canonical)) != 0)
+        return CLI_ADDRESS_ASSIGN_INVALID;
+
+    for (int i = 0; i < policy->n_allowed_src_prefixes; i++) {
+        const mqvpn_cidr_entry_t *known = &policy->allowed_src_prefixes[i];
+        if (known->family == entry.family && known->prefix_len == entry.prefix_len &&
+            memcmp(known->net, entry.net, sizeof(entry.net)) == 0)
+            return CLI_ADDRESS_ASSIGN_OK;
+    }
+
+    if (policy->n_allowed_src_prefixes >= MQVPN_MAX_ROUTES)
+        return CLI_ADDRESS_ASSIGN_CAPACITY;
+    policy->allowed_src_prefixes[policy->n_allowed_src_prefixes++] = entry;
+    return CLI_ADDRESS_ASSIGN_OK;
+}
+
+static int
+cli_address_policy_parse(const uint8_t *payload, size_t payload_len,
+                         cli_address_policy_t *policy)
+{
+    if ((!payload && payload_len != 0) || !policy) return CLI_ADDRESS_ASSIGN_INVALID;
+    memset(policy, 0, sizeof(*policy));
+
+    const uint8_t *p = payload;
+    size_t remaining = payload_len;
+    while (remaining > 0) {
+        uint64_t req_id;
+        uint8_t family, addr[16], prefix_len;
+        size_t addr_len = sizeof(addr), consumed = 0;
+        xqc_int_t xret = xqc_h3_ext_connectip_parse_address_assign(
+            p, remaining, &req_id, &family, addr, &addr_len, &prefix_len, &consumed);
+        if (xret != XQC_OK || consumed == 0 || consumed > remaining)
+            return CLI_ADDRESS_ASSIGN_INVALID;
+        policy->wire_entry_count++;
+        if (policy->wire_entry_count == 1) policy->sole_request_id = req_id;
+
+        /* RFC 9484 section 4.7.2 represents a rejected ADDRESS_REQUEST as a
+         * nonzero request ID paired with the all-zero address and the
+         * family's maximum prefix length.  It is response metadata, not a
+         * source prefix assignment, and ordering carries no semantics. */
+        size_t expected_len = family == 4 ? 4u : family == 6 ? 16u : 0u;
+        uint8_t max_prefix = family == 4 ? 32u : family == 6 ? 128u : 0u;
+        uint8_t zero_addr[16] = {0};
+        if (req_id != 0 && expected_len != 0 && addr_len == expected_len &&
+            prefix_len == max_prefix &&
+            memcmp(addr, zero_addr, expected_len) == 0) {
+            p += consumed;
+            remaining -= consumed;
+            continue;
+        }
+
+        int rc =
+            cli_address_policy_add(policy, family, addr, addr_len, prefix_len);
+        if (rc != CLI_ADDRESS_ASSIGN_OK) return rc;
+        p += consumed;
+        remaining -= consumed;
+    }
+    return CLI_ADDRESS_ASSIGN_OK; /* empty payload is a valid revoke-all */
+}
+
+static int
+cli_address_policy_is_legacy_v4_seed(const cli_address_policy_t *policy)
+{
+    static const uint8_t zero4[4] = {0};
+    return policy->wire_entry_count == 1 && policy->sole_request_id == 0 &&
+           policy->addr_assigned && !policy->addr6_assigned &&
+           policy->assigned_prefix == 32 &&
+           memcmp(policy->assigned_ip, zero4, sizeof(zero4)) != 0 &&
+           policy->n_allowed_src_prefixes == 0;
+}
+
+static int
+cli_address_policy_is_legacy_v6_continuation(const cli_address_policy_t *policy)
+{
+    if (policy->wire_entry_count != 1 || policy->sole_request_id != 0 ||
+        policy->addr_assigned || !policy->addr6_assigned ||
+        policy->assigned_prefix6 == 0 || policy->assigned_prefix6 >= 128 ||
+        policy->n_allowed_src_prefixes != 0)
+        return 0;
+
+    /* The old mqvpn server put a host address on the wire with its pool
+     * prefix.  That non-canonical tuple is the compatibility fingerprint;
+     * a standards-compliant canonical v6-only snapshot remains a replacement. */
+    uint8_t canonical[16];
+    memcpy(canonical, policy->assigned_ip6, sizeof(canonical));
+    mqvpn_cidr_premask(canonical, policy->assigned_prefix6);
+    return memcmp(canonical, policy->assigned_ip6, sizeof(canonical)) != 0;
+}
+
+static int
+cli_address_policy_can_legacy_merge(const cli_conn_t *conn,
+                                    const cli_address_policy_t *next)
+{
+    return conn->legacy_initial_address_state == CLI_LEGACY_ADDRESS_V4_PENDING &&
+           conn->addr_assigned && !conn->addr6_assigned &&
+           conn->assigned_prefix == 32 && conn->n_allowed_src_prefixes == 0 &&
+           cli_address_policy_is_legacy_v6_continuation(next);
+}
+
 static void
+cli_address_policy_disarm_legacy(cli_conn_t *conn)
+{
+    if (conn &&
+        conn->legacy_initial_address_state == CLI_LEGACY_ADDRESS_V4_PENDING)
+        conn->legacy_initial_address_state = CLI_LEGACY_ADDRESS_DISARMED;
+}
+
+static void
+cli_address_policy_commit(cli_conn_t *conn, const cli_address_policy_t *policy)
+{
+    mqvpn_client_t *c = conn->client;
+
+    conn->addr_assigned = policy->addr_assigned;
+    memcpy(conn->assigned_ip, policy->assigned_ip, sizeof(conn->assigned_ip));
+    conn->assigned_prefix = policy->assigned_prefix;
+    conn->addr6_assigned = policy->addr6_assigned;
+    memcpy(conn->assigned_ip6, policy->assigned_ip6, sizeof(conn->assigned_ip6));
+    conn->assigned_prefix6 = policy->assigned_prefix6;
+    memset(conn->allowed_src_prefixes, 0, sizeof(conn->allowed_src_prefixes));
+    if (policy->n_allowed_src_prefixes > 0) {
+        memcpy(conn->allowed_src_prefixes, policy->allowed_src_prefixes,
+               (size_t)policy->n_allowed_src_prefixes *
+                   sizeof(policy->allowed_src_prefixes[0]));
+    }
+    conn->n_allowed_src_prefixes = policy->n_allowed_src_prefixes;
+
+    memset(c->assigned_ip, 0, sizeof(c->assigned_ip));
+    c->assigned_prefix = 0;
+    memset(c->assigned_ip6, 0, sizeof(c->assigned_ip6));
+    c->assigned_prefix6 = 0;
+    c->has_v6 = 0;
+    if (policy->addr_assigned) {
+        memcpy(c->assigned_ip, policy->assigned_ip, sizeof(c->assigned_ip));
+        c->assigned_prefix = policy->assigned_prefix;
+        LOG_I(c, "ADDRESS_ASSIGN: IPv4 %d.%d.%d.%d/%d", policy->assigned_ip[0],
+              policy->assigned_ip[1], policy->assigned_ip[2], policy->assigned_ip[3],
+              policy->assigned_prefix);
+    }
+    if (policy->addr6_assigned) {
+        memcpy(c->assigned_ip6, policy->assigned_ip6, sizeof(c->assigned_ip6));
+        c->assigned_prefix6 = policy->assigned_prefix6;
+        c->has_v6 = 1;
+        char v6s[INET6_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET6, policy->assigned_ip6, v6s, sizeof(v6s)))
+            snprintf(v6s, sizeof(v6s), "<invalid>");
+        LOG_I(c, "ADDRESS_ASSIGN: IPv6 %s/%d", v6s, policy->assigned_prefix6);
+    }
+
+    for (int i = 0; i < policy->n_allowed_src_prefixes; i++) {
+        const mqvpn_cidr_entry_t *entry = &policy->allowed_src_prefixes[i];
+        char nets[INET6_ADDRSTRLEN];
+        int af = entry->family == 4 ? AF_INET : AF_INET6;
+        if (!inet_ntop(af, entry->net, nets, sizeof(nets)))
+            snprintf(nets, sizeof(nets), "<invalid>");
+        LOG_I(c, "ADDRESS_ASSIGN: allowed source prefix %s/%d", nets,
+              entry->prefix_len);
+    }
+    LOG_I(c, "ADDRESS_ASSIGN snapshot committed: v4=%d v6=%d routed_prefixes=%d",
+          policy->addr_assigned, policy->addr6_assigned,
+          policy->n_allowed_src_prefixes);
+}
+
+static int
+cli_address_policy_install(cli_conn_t *conn, const uint8_t *payload, size_t payload_len)
+{
+    if (!conn || !conn->client) return CLI_ADDRESS_ASSIGN_INVALID;
+    cli_address_policy_t *next = malloc(sizeof(*next));
+    if (!next) {
+        conn->legacy_initial_address_state = CLI_LEGACY_ADDRESS_DISARMED;
+        return CLI_ADDRESS_ASSIGN_NOMEM;
+    }
+    int rc = cli_address_policy_parse(payload, payload_len, next);
+    if (rc == CLI_ADDRESS_ASSIGN_OK) {
+        if (cli_address_policy_can_legacy_merge(conn, next)) {
+            /* Compatibility with mqvpn <= 0.16's initial dual-stack wire
+             * shape only.  Preserve the immediately preceding v4 primary;
+             * routed prefixes cannot be involved in either singleton. */
+            next->addr_assigned = 1;
+            memcpy(next->assigned_ip, conn->assigned_ip,
+                   sizeof(next->assigned_ip));
+            next->assigned_prefix = conn->assigned_prefix;
+            conn->legacy_initial_address_state = CLI_LEGACY_ADDRESS_DISARMED;
+            LOG_I(conn->client,
+                  "merged legacy split initial IPv4/IPv6 ADDRESS_ASSIGN");
+        } else if (conn->legacy_initial_address_state ==
+                       CLI_LEGACY_ADDRESS_UNUSED &&
+                   !conn->addr_assigned && !conn->addr6_assigned &&
+                   cli_address_policy_is_legacy_v4_seed(next)) {
+            conn->legacy_initial_address_state =
+                CLI_LEGACY_ADDRESS_V4_PENDING;
+        } else {
+            conn->legacy_initial_address_state = CLI_LEGACY_ADDRESS_DISARMED;
+        }
+        cli_address_policy_commit(conn, next);
+    } else {
+        conn->legacy_initial_address_state = CLI_LEGACY_ADDRESS_DISARMED;
+    }
+    free(next);
+    return rc;
+}
+
+/* Exact primary address OR one same-family routed prefix.  addr may point to
+ * only four bytes for IPv4, so copy into the classifier's 16-byte layout
+ * before calling mqvpn_cidr_match(). */
+static int
+cli_source_allowed(const cli_conn_t *conn, uint8_t family, const uint8_t *addr)
+{
+    if (!conn || !addr) return 0;
+
+    size_t addr_len;
+    if (family == 4) {
+        addr_len = 4;
+        if (conn->addr_assigned && memcmp(addr, conn->assigned_ip, addr_len) == 0)
+            return 1;
+    } else if (family == 6) {
+        addr_len = 16;
+        if (conn->addr6_assigned && memcmp(addr, conn->assigned_ip6, addr_len) == 0)
+            return 1;
+    } else {
+        return 0;
+    }
+
+    uint8_t padded_addr[16] = {0};
+    memcpy(padded_addr, addr, addr_len);
+    for (int i = 0; i < conn->n_allowed_src_prefixes; i++) {
+        if (mqvpn_cidr_match(&conn->allowed_src_prefixes[i], family, padded_addr))
+            return 1;
+    }
+    return 0;
+}
+
+/* Focused source-policy test hooks.  Hidden from the public ABI. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+int
+mqvpn_client_test_apply_address_assign_capsule(mqvpn_client_t *c,
+                                               const uint8_t *payload,
+                                               size_t payload_len)
+{
+    if (!c || !c->conn) return CLI_ADDRESS_ASSIGN_INVALID;
+    int rc = cli_address_policy_install(c->conn, payload, payload_len);
+    /* Mirror the production fail-closed gate without manufacturing an xquic
+     * request object solely for unit tests. */
+    if (rc != CLI_ADDRESS_ASSIGN_OK) c->conn->tunnel_ok = 0;
+    return rc;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+int
+mqvpn_client_test_source_allowed(const mqvpn_client_t *c, uint8_t family,
+                                 const uint8_t *addr)
+{
+    if (!c || !c->conn) return 0;
+    return cli_source_allowed(c->conn, family, addr);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((visibility("hidden")))
+#endif
+int
+mqvpn_client_test_allowed_src_prefix_count(const mqvpn_client_t *c)
+{
+    if (!c || !c->conn) return -1;
+    return c->conn->n_allowed_src_prefixes;
+}
+
+/* Capsule errors make the CONNECT-IP source policy unusable immediately,
+ * before xquic gets around to its request/connection close notifications.
+ * mqvpn_client_on_tun_packet gates on tunnel_ok, so no packet can observe a
+ * partially parsed or otherwise invalid authorization state. */
+static int
+cli_connect_ip_protocol_error(cli_stream_t *stream)
+{
+    if (stream && stream->conn) {
+        cli_conn_t *conn = stream->conn;
+        mqvpn_client_t *c = conn->client;
+
+        conn->tunnel_ok = 0;
+
+        /* The CONNECT-IP request is the tunnel's lifetime anchor.  Closing
+         * only that request may leave its H3 connection alive, so the normal
+         * conn-close callback never destroys cli_conn_t or arms reconnect.
+         * xqc_h3_conn_close only marks/queues the close here; engine main
+         * logic performs teardown after this read callback unwinds. */
+        if (c && c->engine) {
+            xqc_int_t ret = xqc_h3_conn_close(c->engine, &conn->cid);
+            if (ret != XQC_OK && ret != -XQC_ECONN_NFOUND)
+                LOG_W(c, "CONNECT-IP protocol-error H3 close failed: %d", ret);
+        }
+    } else if (stream && stream->h3_request) {
+        /* Defensive fallback for an unattached request. */
+        xqc_h3_request_close(stream->h3_request);
+    }
+    return -1;
+}
+
+static int
 process_capsules(cli_stream_t *stream)
 {
     cli_conn_t *conn = stream->conn;
@@ -1794,47 +2193,27 @@ process_capsules(cli_stream_t *stream)
             xqc_h3_ext_capsule_decode(stream->capsule_buf, stream->capsule_len, &cap_type,
                                       &payload, &cap_len, &consumed);
         if (xret != XQC_OK) break;
+        if (cap_type != XQC_H3_CAPSULE_ADDRESS_ASSIGN)
+            cli_address_policy_disarm_legacy(conn);
 
         if (cap_type == XQC_H3_CAPSULE_ADDRESS_ASSIGN) {
-            const uint8_t *ap = payload;
-            size_t aremain = cap_len;
-            while (aremain > 0) {
-                uint64_t req_id;
-                uint8_t ip_ver, ip_addr[16], prefix;
-                size_t ip_len = 16, aa_consumed;
-                xret = xqc_h3_ext_connectip_parse_address_assign(
-                    ap, aremain, &req_id, &ip_ver, ip_addr, &ip_len, &prefix,
-                    &aa_consumed);
-                if (xret != XQC_OK) break;
-
-                if (ip_ver == 4 && !conn->addr_assigned) {
-                    memcpy(conn->assigned_ip, ip_addr, 4);
-                    conn->assigned_prefix = prefix;
-                    conn->addr_assigned = 1;
-                    memcpy(c->assigned_ip, ip_addr, 4);
-                    c->assigned_prefix = prefix;
-                    LOG_I(c, "ADDRESS_ASSIGN: IPv4 %d.%d.%d.%d/%d", ip_addr[0],
-                          ip_addr[1], ip_addr[2], ip_addr[3], prefix);
-                } else if (ip_ver == 6 && !conn->addr6_assigned) {
-                    memcpy(conn->assigned_ip6, ip_addr, 16);
-                    conn->assigned_prefix6 = prefix;
-                    conn->addr6_assigned = 1;
-                    memcpy(c->assigned_ip6, ip_addr, 16);
-                    c->assigned_prefix6 = prefix;
-                    c->has_v6 = 1;
-                    char v6s[INET6_ADDRSTRLEN];
-                    inet_ntop(AF_INET6, ip_addr, v6s, sizeof(v6s));
-                    LOG_I(c, "ADDRESS_ASSIGN: IPv6 %s/%d", v6s, prefix);
+            int arc = cli_address_policy_install(conn, payload, cap_len);
+            if (arc != CLI_ADDRESS_ASSIGN_OK) {
+                if (arc == CLI_ADDRESS_ASSIGN_CAPACITY) {
+                    LOG_E(c, "ADDRESS_ASSIGN source-prefix capacity exceeded (%d)",
+                          MQVPN_MAX_ROUTES);
+                } else if (arc == CLI_ADDRESS_ASSIGN_NOMEM) {
+                    LOG_E(c, "ADDRESS_ASSIGN policy allocation failed");
+                } else {
+                    LOG_E(c, "malformed ADDRESS_ASSIGN snapshot (len=%zu)", cap_len);
                 }
-                ap += aa_consumed;
-                aremain -= aa_consumed;
+                return cli_connect_ip_protocol_error(stream);
             }
         } else if (cap_type == XQC_H3_CAPSULE_ROUTE_ADVERTISEMENT) {
             xret = xqc_h3_ext_connectip_validate_route_advertisement(payload, cap_len);
             if (xret != XQC_OK) {
                 LOG_E(c, "ROUTE_ADVERTISEMENT validation failed");
-                xqc_h3_request_close(stream->h3_request);
-                return;
+                return cli_connect_ip_protocol_error(stream);
             }
             /* Log routes but no action needed */
         } else if (cap_type == MQVPN_CAPSULE_PATH_LABEL_PUSH) {
@@ -1898,6 +2277,7 @@ process_capsules(cli_stream_t *stream)
                     stream->capsule_len - consumed);
         stream->capsule_len -= consumed;
     }
+    return 0;
 }
 
 /* ─── H3 request callbacks ─── */
@@ -1953,11 +2333,25 @@ cb_request_close(xqc_h3_request_t *h3_request, void *user_data)
 {
     (void)h3_request;
     cli_stream_t *stream = (cli_stream_t *)user_data;
+    mqvpn_client_t *close_client = NULL;
+    xqc_cid_t close_cid = {0};
+    int close_tunnel_conn = 0;
     if (stream) {
         /* Only the CONNECT-IP tunnel stream owns tunnel_ok — a closing
          * per-flow connect-tcp stream must not flip the tunnel dead. */
         if (stream->conn && stream->role == CLI_STREAM_ROLE_CONNECT_IP) {
+            cli_conn_t *conn = stream->conn;
             cli_connect_ip_on_request_close(stream->conn);
+
+            /* A standalone tunnel-request close must also retire the H3
+             * connection.  Otherwise cb_h3_conn_close never destroys this
+             * connection-scoped policy/state or schedules reconnect.  Do
+             * not recurse during an already requested local shutdown. */
+            if (!conn->client->shutting_down) {
+                close_client = conn->client;
+                close_cid = conn->cid;
+                close_tunnel_conn = 1;
+            }
         }
 #ifdef MQVPN_HYBRID_TCP_LANE_ENABLED
         /* Task 12 (reconciliation G): this is the FINAL close notify for
@@ -1986,6 +2380,15 @@ cb_request_close(xqc_h3_request_t *h3_request, void *user_data)
 #endif
         free(stream->capsule_buf);
         free(stream);
+    }
+
+    /* Close after freeing the request wrapper: xquic queues connection
+     * teardown, but keeping no stream references here also makes the code
+     * safe if that behavior ever becomes more eager. */
+    if (close_tunnel_conn && close_client->engine) {
+        xqc_int_t ret = xqc_h3_conn_close(close_client->engine, &close_cid);
+        if (ret != XQC_OK && ret != -XQC_ECONN_NFOUND)
+            LOG_W(close_client, "CONNECT-IP request-close H3 close failed: %d", ret);
     }
     return 0;
 }
@@ -2082,7 +2485,7 @@ cli_connect_ip_on_headers(cli_stream_t *stream, xqc_h3_request_t *h3_request)
 }
 
 /* CONNECT-IP tunnel stream: capsule body + ADDRESS_ASSIGN → tunnel_config_ready.
- * Returns -1 on capsule buffer failure. */
+ * Returns -1 on capsule framing or policy failure. */
 static int
 cli_connect_ip_on_body(cli_stream_t *stream, xqc_h3_request_t *h3_request)
 {
@@ -2095,9 +2498,20 @@ cli_connect_ip_on_body(cli_stream_t *stream, xqc_h3_request_t *h3_request)
     do {
         n = xqc_h3_request_recv_body(h3_request, buf, sizeof(buf), &fin);
         if (n <= 0) break;
-        if (stream_append_capsules(stream, buf, (size_t)n) < 0) return -1;
-        process_capsules(stream);
+        if (stream_append_capsules(stream, buf, (size_t)n) < 0) {
+            LOG_E(c, "CONNECT-IP capsule buffer exhausted");
+            return cli_connect_ip_protocol_error(stream);
+        }
+        if (process_capsules(stream) < 0) return -1;
     } while (!fin);
+
+    /* A final body with bytes that cannot form a complete capsule is a wire
+     * error, not a reason to retain a partially learned source policy. */
+    if (fin && stream->capsule_len != 0) {
+        LOG_E(c, "CONNECT-IP body ended with an incomplete capsule (%zu bytes)",
+              stream->capsule_len);
+        return cli_connect_ip_protocol_error(stream);
+    }
 
     /* Notify platform on ADDRESS_ASSIGN */
     if (conn->addr_assigned && c->state != MQVPN_STATE_ESTABLISHED &&
@@ -2337,7 +2751,10 @@ cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag,
     case CLI_STREAM_ROLE_CONNECT_IP:
         if (flag & XQC_REQ_NOTIFY_READ_HEADER)
             cli_connect_ip_on_headers(stream, h3_request);
-        if (flag & XQC_REQ_NOTIFY_READ_BODY)
+        /* Empty FIN is a standalone notify in xquic.  Feed it through the
+         * same body handler so a buffered partial capsule is rejected by the
+         * final-framing check instead of surviving on a half-closed tunnel. */
+        if (flag & (XQC_REQ_NOTIFY_READ_BODY | XQC_REQ_NOTIFY_READ_EMPTY_FIN))
             return cli_connect_ip_on_body(stream, h3_request);
         return 0;
 #ifdef MQVPN_HYBRID_TCP_LANE_ENABLED
@@ -4070,7 +4487,7 @@ tun_validate_src(mqvpn_client_t *c, cli_conn_t *conn, const uint8_t *pkt, size_t
                  uint8_t ip_ver)
 {
     if (ip_ver == 4) {
-        if (conn->addr_assigned && memcmp(pkt + 12, conn->assigned_ip, 4) != 0) {
+        if (!cli_source_allowed(conn, 4, pkt + 12)) {
             LOG_D(c, "tun drop: IPv4 src mismatch (len=%zu)", len);
             return TUN_INGRESS_DROP; /* silently drop: src mismatch */
         }
@@ -4079,7 +4496,7 @@ tun_validate_src(mqvpn_client_t *c, cli_conn_t *conn, const uint8_t *pkt, size_t
             LOG_D(c, "tun drop: IPv6 too short or no addr6 (len=%zu)", len);
             return TUN_INGRESS_DROP;
         }
-        if (memcmp(pkt + 8, conn->assigned_ip6, 16) != 0) {
+        if (!cli_source_allowed(conn, 6, pkt + 8)) {
             LOG_D(c, "tun drop: IPv6 src mismatch (len=%zu)", len);
             return TUN_INGRESS_DROP;
         }

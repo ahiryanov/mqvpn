@@ -16,7 +16,8 @@
 #include <stdbool.h>
 
 /* ─── Constants ─── */
-/* MQVPN_MAX_PATHS and MQVPN_MAX_USERS are defined in libmqvpn.h */
+/* MQVPN_MAX_PATHS, MQVPN_MAX_USERS and MQVPN_MAX_ROUTES are defined in
+ * libmqvpn.h. */
 
 /* Mirror of xquic's private xqc_path_state_t (third_party/xquic/
  * src/transport/xqc_multipath.h). The library links shared xquic and sees
@@ -91,6 +92,12 @@ struct mqvpn_config_s {
     char user_keys[MQVPN_MAX_USERS][256];
     char user_fixed_ips[MQVPN_MAX_USERS][20]; /* "" = dynamic, "x.x.x.x" = pinned */
     int n_users;
+    /* Server-side native routed prefixes. Entries are canonical/pre-masked;
+     * route_users stores stable names rather than indexes because user removal
+     * compacts the user arrays. */
+    mqvpn_cidr_entry_t route_prefixes[MQVPN_MAX_ROUTES];
+    char route_users[MQVPN_MAX_ROUTES][64];
+    int n_routes;
     int insecure;
 
     mqvpn_scheduler_t scheduler;

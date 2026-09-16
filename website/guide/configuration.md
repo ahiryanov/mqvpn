@@ -23,6 +23,14 @@ Key = mPyVpoQWcp/5gr404xvS19aRC03o0XS2mrb2tZJ1Ii4=
 User = alice:<ALICE_PSK>
 User = bob:<BOB_PSK>
 
+[Route]
+User = alice
+Prefix = 10.50.0.0/16
+
+[Route]
+User = alice
+Prefix = 10.60.8.0/24
+
 [Multipath]
 Scheduler = wlb
 # CC = bbr2                     # Congestion control (bbr2|bbr|cubic|none)
@@ -73,6 +81,10 @@ JSON config is useful for structured management and automation tooling.
     { "name": "alice", "key": "<ALICE_PSK>" },
     { "name": "bob", "key": "<BOB_PSK>" }
   ],
+  "routes": [
+    { "user": "alice", "prefix": "10.50.0.0/16" },
+    { "user": "alice", "prefix": "10.60.8.0/24" }
+  ],
   "max_clients": 64,
   "scheduler": "wlb",
   "cc": "bbr2"
@@ -107,6 +119,39 @@ The server can authenticate multiple users, each with their own PSK. In JSON con
 When both `auth_key` (global key) and `users` are set, clients can authenticate with either. To restrict access to named users only, remove `auth_key` from the config.
 
 Removing a user via the Control API also disconnects any active sessions authenticated with that username.
+
+## Native Routed Networks
+
+Use one repeated `[Route]` section, or one JSON `routes` object, for every
+network reachable behind a named client. The owner must be declared under
+`[Auth] User`/`users` and must connect with that per-user key. A client using
+the legacy global key cannot claim a route through `auth_username`/`x-user`.
+
+mqvpn supports up to 512 routed prefixes while retaining the existing limit of
+64 named users. Host bits are normalized. Repeating the same prefix for the
+same owner is harmless, assigning the exact prefix to two owners is rejected,
+and nested prefixes are selected by longest-prefix match. A prefix may not
+overlap the tunnel pool; IPv6 routed prefixes require `Subnet6`.
+
+The server conveys the owner's prefixes to the client with standard CONNECT-IP
+`ADDRESS_ASSIGN` entries, so no matching client-side list or extra IPIP tunnel
+is required. Linux routing remains operator-managed: enable forwarding and the
+`FORWARD` firewall path on the client, keep NAT disabled for routed traffic,
+route the central networks through the client TUN, route each LAN prefix into
+the server TUN, and provide the corresponding return routes. Review
+`rp_filter` and policy routing when paths are asymmetric.
+
+With Hybrid enabled, TCP initiated by a host behind the client is still
+eligible for `Tcp = stream`. TCP initiated from the central side toward that
+host uses the raw CONNECT-IP datagram lane. For LAN-initiated Hybrid TCP toward
+an RFC1918 central network, add the central CIDR to the server's repeated
+`[Hybrid] EgressAllow` list; private egress targets remain denied by default.
+
+Hybrid TCP stream mode creates a new TCP connection from the server, so the
+destination sees the server's source address. Set `[Hybrid] Tcp = raw` on the
+client (or disable Hybrid) when LAN source addresses must be preserved.
+Both endpoints must run this routed-network implementation; older clients
+do not process the additional source prefixes.
 
 ::: warning Monitoring requires per-user keys
 Sharing a single `auth_key` across multiple clients works for the VPN data plane, but the Control API and the Prometheus exporter identify clients by their `user` label. Sessions authenticated with the global `auth_key` are reported as `user="(global)"`, so multiple clients collide on the same label and the Prometheus scrape is dropped. For multi-client monitoring give each client its own entry under `users` (or register them at runtime via `add_user`).
@@ -161,6 +206,13 @@ sudo mqvpn --config /etc/mqvpn/server.json
 | `MaxClients` | Maximum concurrent clients (server only) | `64` |
 
 In JSON, use `auth_key` on both client and server (as in the examples above).
+
+### `[Route]` (server only, repeatable)
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `User` | Existing named user that owns the routed prefix | Required |
+| `Prefix` | IPv4 or IPv6 CIDR reachable behind that user's client | Required |
 
 ### `[Multipath]`
 

@@ -17,6 +17,8 @@
 #include <stdio.h>
 
 int mqvpn_config_add_user(mqvpn_config_t *cfg, const char *username, const char *key);
+int mqvpn_config_add_route(mqvpn_config_t *cfg, const char *username,
+                           const char *prefix);
 
 /* json_skip_ws, mqvpn_copy_str, json_find_key, json_read_string, json_read_bool,
  * json_read_int are provided by json_mini.h */
@@ -72,10 +74,96 @@ static int
 json_read_users(mqvpn_config_t *cfg, const char *p)
 {
     if (!cfg || !p || *p != '[') return MQVPN_ERR_INVALID_ARG;
-    cfg->n_users = 0;
-    return (mqvpn_json_parse_users(p, cfg, json_add_user_cb) == 0)
-               ? MQVPN_OK
-               : MQVPN_ERR_INVALID_ARG;
+
+    /* Parse into a disposable config so a malformed replacement cannot leave
+     * a half-replaced credential table behind.  Only the user arrays are
+     * committed; all unrelated builder state remains untouched. */
+    mqvpn_config_t *staged = calloc(1, sizeof(*staged));
+    if (!staged) return MQVPN_ERR_NO_MEMORY;
+    int rc = mqvpn_json_parse_users(p, staged, json_add_user_cb);
+    if (rc == 0) {
+        memcpy(cfg->user_names, staged->user_names, sizeof(cfg->user_names));
+        memcpy(cfg->user_keys, staged->user_keys, sizeof(cfg->user_keys));
+        memcpy(cfg->user_fixed_ips, staged->user_fixed_ips,
+               sizeof(cfg->user_fixed_ips));
+        cfg->n_users = staged->n_users;
+    }
+    free(staged);
+    return rc == 0 ? MQVPN_OK : MQVPN_ERR_INVALID_ARG;
+}
+
+static int
+json_read_string_strict_bounded(const char *value, const char *obj_end,
+                                char *out, size_t out_len)
+{
+    if (!value || !obj_end || !out || out_len == 0 || value >= obj_end ||
+        *value != '"')
+        return -1;
+
+    const char *p = value + 1;
+    size_t n = 0;
+    while (p < obj_end && *p && *p != '"') {
+        if (*p == '\\') {
+            p++;
+            if (p >= obj_end || *p == '\0') return -1;
+        }
+        if (n + 1 >= out_len) return -1;
+        out[n++] = *p++;
+    }
+    if (p >= obj_end || *p != '"') return -1;
+    out[n] = '\0';
+    return 0;
+}
+
+static int
+json_read_routes(mqvpn_config_t *cfg, const char *p)
+{
+    if (!cfg || !p || *p != '[') return MQVPN_ERR_INVALID_ARG;
+
+    /* Route arrays are replacement state.  Parse into a full clone so a
+     * valid prefix followed by a malformed/conflicting row cannot erase the
+     * old table or leave a partial replacement behind. */
+    mqvpn_config_t *staged = malloc(sizeof(*staged));
+    if (!staged) return MQVPN_ERR_NO_MEMORY;
+    memcpy(staged, cfg, sizeof(*staged));
+    memset(staged->route_prefixes, 0, sizeof(staged->route_prefixes));
+    memset(staged->route_users, 0, sizeof(staged->route_users));
+    staged->n_routes = 0;
+
+    int rc = MQVPN_ERR_INVALID_ARG;
+    p = json_skip_ws(p + 1);
+
+    while (*p && *p != ']') {
+        if (*p != '{') goto out;
+        const char *obj_end = json_object_end(p);
+        if (!obj_end) goto out;
+
+        char user[64], prefix[INET6_ADDRSTRLEN + 8];
+        const char *uv = json_find_key_bounded(p, obj_end, "user");
+        const char *pv = json_find_key_bounded(p, obj_end, "prefix");
+        if (json_read_string_strict_bounded(uv, obj_end, user, sizeof(user)) != 0 ||
+            json_read_string_strict_bounded(pv, obj_end, prefix, sizeof(prefix)) != 0 ||
+            user[0] == '\0' || prefix[0] == '\0' ||
+            mqvpn_config_add_route(staged, user, prefix) != MQVPN_OK)
+            goto out;
+
+        p = json_skip_ws(obj_end + 1);
+        if (*p == ',')
+            p = json_skip_ws(p + 1);
+        else if (*p != ']')
+            goto out;
+    }
+    if (*p != ']') goto out;
+
+    memcpy(cfg->route_prefixes, staged->route_prefixes,
+           sizeof(cfg->route_prefixes));
+    memcpy(cfg->route_users, staged->route_users, sizeof(cfg->route_users));
+    cfg->n_routes = staged->n_routes;
+    rc = MQVPN_OK;
+
+out:
+    free(staged);
+    return rc;
 }
 
 /* JSON path deliberately does NOT gate "backup_fec" on XQC_ENABLE_FEC (that
@@ -225,6 +313,10 @@ mqvpn_config_add_user(mqvpn_config_t *cfg, const char *username, const char *key
     if (!cfg || !username || !key || username[0] == '\0' || key[0] == '\0') {
         return MQVPN_ERR_INVALID_ARG;
     }
+    if (strlen(username) >= sizeof(cfg->user_names[0]) ||
+        strlen(key) >= sizeof(cfg->user_keys[0])) {
+        return MQVPN_ERR_INVALID_ARG;
+    }
 
     /* Reject characters that would break JSON serialization in control API */
     for (const char *p = username; *p; p++) {
@@ -251,6 +343,70 @@ mqvpn_config_add_user(mqvpn_config_t *cfg, const char *username, const char *key
     return MQVPN_OK;
 }
 
+static int
+route_user_exists(const mqvpn_config_t *cfg, const char *username)
+{
+    for (int i = 0; i < cfg->n_users; i++)
+        if (strcmp(cfg->user_names[i], username) == 0) return 1;
+    return 0;
+}
+
+static int
+route_prefix_equal(const mqvpn_cidr_entry_t *a, const mqvpn_cidr_entry_t *b)
+{
+    return a->family == b->family && a->prefix_len == b->prefix_len &&
+           memcmp(a->net, b->net, sizeof(a->net)) == 0;
+}
+
+int
+mqvpn_config_add_route(mqvpn_config_t *cfg, const char *username, const char *prefix)
+{
+    if (!cfg || !username || !prefix || username[0] == '\0' || prefix[0] == '\0')
+        return MQVPN_ERR_INVALID_ARG;
+    /* Unlike snprintf-based descriptive fields, an ACL owner must never be
+     * silently truncated into a different identity. */
+    if (strlen(username) >= sizeof(cfg->route_users[0]) ||
+        strcmp(username, "(global)") == 0)
+        return MQVPN_ERR_INVALID_ARG;
+    if (!route_user_exists(cfg, username)) return MQVPN_ERR_INVALID_ARG;
+
+    mqvpn_cidr_entry_t parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    if (mqvpn_parse_cidr(prefix, &parsed) != 0) return MQVPN_ERR_INVALID_ARG;
+
+    for (int i = 0; i < cfg->n_routes; i++) {
+        if (!route_prefix_equal(&cfg->route_prefixes[i], &parsed)) continue;
+        return strcmp(cfg->route_users[i], username) == 0 ? MQVPN_OK
+                                                          : MQVPN_ERR_INVALID_ARG;
+    }
+
+    if (cfg->n_routes >= MQVPN_MAX_ROUTES) return MQVPN_ERR_MAX_CLIENTS;
+    int i = cfg->n_routes++;
+    cfg->route_prefixes[i] = parsed;
+    memcpy(cfg->route_users[i], username, strlen(username) + 1);
+    return MQVPN_OK;
+}
+
+static void
+routes_prune_missing_users(mqvpn_config_t *cfg)
+{
+    int out = 0;
+    for (int i = 0; i < cfg->n_routes; i++) {
+        if (!route_user_exists(cfg, cfg->route_users[i])) continue;
+        if (out != i) {
+            cfg->route_prefixes[out] = cfg->route_prefixes[i];
+            memcpy(cfg->route_users[out], cfg->route_users[i],
+                   sizeof(cfg->route_users[out]));
+        }
+        out++;
+    }
+    for (int i = out; i < cfg->n_routes; i++) {
+        memset(&cfg->route_prefixes[i], 0, sizeof(cfg->route_prefixes[i]));
+        memset(cfg->route_users[i], 0, sizeof(cfg->route_users[i]));
+    }
+    cfg->n_routes = out;
+}
+
 int
 mqvpn_config_remove_user(mqvpn_config_t *cfg, const char *username)
 {
@@ -269,6 +425,25 @@ mqvpn_config_remove_user(mqvpn_config_t *cfg, const char *username)
                        sizeof(cfg->user_fixed_ips[j - 1]));
             }
             cfg->n_users--;
+
+            /* Routes are owned by a stable authenticated username. Remove
+             * them with the user so a later re-add of the same name cannot
+             * unexpectedly resurrect stale reachability. */
+            int out = 0;
+            for (int r = 0; r < cfg->n_routes; r++) {
+                if (strcmp(cfg->route_users[r], username) == 0) continue;
+                if (out != r) {
+                    cfg->route_prefixes[out] = cfg->route_prefixes[r];
+                    memcpy(cfg->route_users[out], cfg->route_users[r],
+                           sizeof(cfg->route_users[out]));
+                }
+                out++;
+            }
+            for (int r = out; r < cfg->n_routes; r++) {
+                memset(&cfg->route_prefixes[r], 0, sizeof(cfg->route_prefixes[r]));
+                memset(cfg->route_users[r], 0, sizeof(cfg->route_users[r]));
+            }
+            cfg->n_routes = out;
             return MQVPN_OK;
         }
     }
@@ -580,9 +755,40 @@ mqvpn_config_load_json(mqvpn_config_t *cfg, const char *json_text)
         }
     }
 
-    v = json_find_key(json_text, "users");
-    if (v && json_read_users(cfg, v) != MQVPN_OK) {
-        return MQVPN_ERR_INVALID_ARG;
+    const char *users_v = json_find_key(json_text, "users");
+    const char *routes_v = json_find_key(json_text, "routes");
+    if (users_v || routes_v) {
+        /* users and routes form one authorization policy.  Stage them
+         * together so `{users: valid, routes: valid-then-invalid}` cannot
+         * commit new credentials, prune old routes, and then report failure. */
+        mqvpn_config_t *policy = malloc(sizeof(*policy));
+        if (!policy) return MQVPN_ERR_NO_MEMORY;
+        memcpy(policy, cfg, sizeof(*policy));
+
+        int policy_rc = MQVPN_OK;
+        if (users_v) {
+            policy_rc = json_read_users(policy, users_v);
+            if (policy_rc == MQVPN_OK) routes_prune_missing_users(policy);
+        }
+        /* Routes follow users deliberately: ownership is checked against the
+         * staged replacement credentials regardless of textual key order. */
+        if (policy_rc == MQVPN_OK && routes_v)
+            policy_rc = json_read_routes(policy, routes_v);
+
+        if (policy_rc == MQVPN_OK) {
+            memcpy(cfg->user_names, policy->user_names, sizeof(cfg->user_names));
+            memcpy(cfg->user_keys, policy->user_keys, sizeof(cfg->user_keys));
+            memcpy(cfg->user_fixed_ips, policy->user_fixed_ips,
+                   sizeof(cfg->user_fixed_ips));
+            cfg->n_users = policy->n_users;
+            memcpy(cfg->route_prefixes, policy->route_prefixes,
+                   sizeof(cfg->route_prefixes));
+            memcpy(cfg->route_users, policy->route_users,
+                   sizeof(cfg->route_users));
+            cfg->n_routes = policy->n_routes;
+        }
+        free(policy);
+        if (policy_rc != MQVPN_OK) return policy_rc;
     }
 
     return MQVPN_OK;

@@ -233,6 +233,16 @@ User = alice:alice-secret
 User = bob:bob-secret
 User = carol:carol-secret:10.0.0.50   # fixed IP — always assigned this address
 
+# Native networks behind a named client (repeat [Route] for every prefix).
+# Routed owners must authenticate with their per-user key, not the global Key.
+[Route]
+User = carol
+Prefix = 10.50.0.0/16
+
+[Route]
+User = carol
+Prefix = 10.60.8.0/24
+
 [Multipath]
 Scheduler = wlb
 # Scheduler = wrtt              # weighted RTT aggregation (set per-path weights via control API)
@@ -315,6 +325,10 @@ Server example:
         { "name": "carol", "key": "carol-secret", "fixed_ip": "10.0.0.50" },
         "bob:bob-secret"
     ],
+    "routes": [
+        { "user": "carol", "prefix": "10.50.0.0/16" },
+        { "user": "carol", "prefix": "10.60.8.0/24" }
+    ],
     "max_clients": 64,
     "scheduler": "wlb",
     "cc": "bbr2",
@@ -365,6 +379,7 @@ Client example:
 Notes:
 - `users` is server-side auth and accepts either objects (`{"name","key"}` or `{"name","key","fixed_ip"}`) or `"name:key"` strings.
 - A `fixed_ip` in a user object pins that IPv4 address to the user. The address is removed from the dynamic pool at startup and never assigned to other clients. The INI equivalent is `User = name:key:fixed_ip`.
+- `routes` is a server-side list of IPv4/IPv6 networks reachable behind named clients. The INI equivalent is one repeated `[Route]` section per prefix. A route owner must exist under `users` and authenticate with that user's key; the legacy global `auth_key` plus a client-supplied `auth_username` cannot claim routed networks. Up to 512 prefixes can be configured without changing the existing 64-user limit. Exact duplicate prefixes for one owner are idempotent; exact conflicts are rejected, while nested prefixes use longest-prefix match. Routed prefixes must not overlap the tunnel address pool, and IPv6 routes require `subnet6`.
 - `auth_key` remains supported as a single legacy/global key.
 - `auth_username` is client-side only: the name sent to the server for identification in logs and status output. It does not affect authentication.
 - `mode` is optional if it can be inferred (`listen` implies server).
@@ -384,6 +399,41 @@ Notes:
 sudo mqvpn --config /etc/mqvpn/server.conf
 sudo mqvpn --config /etc/mqvpn/client.conf
 ```
+
+### Native networks behind a client
+
+`[Route]` selects the CONNECT-IP session for packets whose destination is a
+network behind that client. The server also sends those prefixes to the
+authenticated client as standard CONNECT-IP `ADDRESS_ASSIGN` entries, so the
+client accepts forwarded LAN source addresses before Hybrid classification.
+No extra IPIP encapsulation or matching route list in the client config is
+needed.
+
+The operating systems still perform the actual routing. For a routed IPv4
+prefix, the deployment must:
+
+- enable IP forwarding and permit the traffic in the `FORWARD` firewall chain
+  on the client router;
+- keep the LAN prefix reachable through the client's LAN interface and route
+  the central networks through its mqvpn TUN;
+- route the LAN prefix into `mqvpn0` on the server/central router (for example,
+  `ip route add 10.50.0.0/16 dev mqvpn0`);
+- provide a return route from the central network to the mqvpn server; and
+- disable source NAT for this traffic and configure `rp_filter`/policy routing
+  consistently with the chosen asymmetric or multipath layout.
+
+LAN-initiated TCP remains eligible for `[Hybrid] Tcp = stream` because mqvpn
+sees the original packet and 5-tuple. TCP initiated from the central side to a
+LAN host continues to use the raw CONNECT-IP datagram lane by design. If the
+LAN initiates Hybrid TCP toward an RFC1918 central network, add that central
+CIDR to the server's repeated `[Hybrid] EgressAllow` list; the existing egress
+ACL otherwise denies private destinations by default.
+
+Hybrid TCP stream mode opens a new TCP connection from the server, so the
+destination sees the server's source address. For transparent routing that
+preserves LAN source addresses, set `[Hybrid] Tcp = raw` on the client (or
+disable Hybrid). Update both endpoints to this routed-network implementation;
+older clients do not process the additional source prefixes.
 
 ## Schedulers
 

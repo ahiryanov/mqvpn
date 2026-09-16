@@ -49,6 +49,7 @@ extern "C" {
 
 #define MQVPN_MAX_USERS            64
 #define MQVPN_MAX_PATHS            8
+#define MQVPN_MAX_ROUTES           512
 #define MQVPN_INIT_MAX_PATH_ID_MAX UINT64_C(0xffffffff)
 /* Persisted per-(user,iface) weight/dscp_mask policy entries (server-only,
  * config.h's "path_policy" JSON array) — not MQVPN_MAX_USERS*MQVPN_MAX_PATHS
@@ -571,6 +572,13 @@ MQVPN_API int mqvpn_config_set_auth_username(mqvpn_config_t *cfg, const char *us
 MQVPN_API int mqvpn_config_add_user(mqvpn_config_t *cfg, const char *username,
                                     const char *key);
 MQVPN_API int mqvpn_config_remove_user(mqvpn_config_t *cfg, const char *username);
+/* Add a server-side routed prefix owned by an existing named user. `prefix`
+ * must be an explicit IPv4/IPv6 CIDR. Host bits are normalized; adding the
+ * same normalized prefix for the same user is idempotent, while assigning an
+ * exact prefix to another user is rejected. Properly nested overlaps are
+ * allowed and resolved by longest-prefix match in the server data plane. */
+MQVPN_API int mqvpn_config_add_route(mqvpn_config_t *cfg, const char *username,
+                                     const char *prefix);
 /* Set a fixed (pinned) IPv4 address for a user. The address is excluded from the
  * dynamic pool so other clients cannot receive it.  Pass ip="" to clear. */
 MQVPN_API int mqvpn_config_set_user_fixed_ip(mqvpn_config_t *cfg, const char *username,

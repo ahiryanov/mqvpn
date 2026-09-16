@@ -969,6 +969,18 @@ if(BUILD_TESTING)
     set_target_properties(test_server PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_server COMMAND test_server)
 
+    # Routed LANs: authenticated ownership over real QUIC loopback connections.
+    add_executable(test_server_routes tests/test_server_routes.c)
+    target_link_libraries(test_server_routes mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} dl m stdc++)
+    target_include_directories(test_server_routes PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(test_server_routes PRIVATE
+        TEST_CERT_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.crt"
+        TEST_KEY_FILE="${CMAKE_SOURCE_DIR}/tests/certs/test.key"
+    )
+    set_target_properties(test_server_routes PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_test(NAME test_server_routes COMMAND test_server_routes)
+    set_tests_properties(test_server_routes PROPERTIES TIMEOUT 60)
+
     # xquic-standby backup path tests (links libmqvpn + xquic)
     add_executable(test_standby_backup tests/test_standby_backup.c)
     target_link_libraries(test_standby_backup mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} dl m stdc++)
@@ -1027,6 +1039,8 @@ if(BUILD_TESTING)
     )
     set_target_properties(test_server_double_connectip PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_server_double_connectip COMMAND test_server_double_connectip)
+    add_test(NAME test_server_routes_reestablish COMMAND test_server_double_connectip --routes)
+    set_tests_properties(test_server_routes_reestablish PROPERTIES TIMEOUT 60)
     # A full QUIC handshake + two H3 requests is slower than the pre-accept
     # probe above; 60s matches that test's budget and is generous for a
     # loopback exchange bounded by this test's own pump-loop iteration caps.

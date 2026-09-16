@@ -1546,6 +1546,20 @@ linux_platform_run_server(const mqvpn_server_cfg_t *cfg)
                                                cfg->user_fixed_ips[i]);
         }
     }
+    /* Users must be installed first: mqvpn_config_add_route validates that a
+     * prefix is owned by an existing named credential. This check also catches
+     * a CLI --user override that replaced the config-file user set while
+     * leaving a now-orphaned persisted route. */
+    for (int i = 0; i < cfg->n_routes; i++) {
+        int route_rc = mqvpn_config_add_route(lib_cfg, cfg->routes[i].user,
+                                              cfg->routes[i].prefix);
+        if (route_rc != MQVPN_OK) {
+            LOG_ERR("invalid route %s owned by '%s' (error %d)",
+                    cfg->routes[i].prefix, cfg->routes[i].user, route_rc);
+            mqvpn_config_free(lib_cfg);
+            return 1;
+        }
+    }
     for (int i = 0; i < cfg->n_path_policy; i++) {
         mqvpn_config_add_path_policy(
             lib_cfg, cfg->path_policy[i].user, cfg->path_policy[i].iface,
