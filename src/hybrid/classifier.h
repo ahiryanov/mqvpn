@@ -219,8 +219,11 @@ mqvpn_parse_cidr(const char *s, mqvpn_cidr_entry_t *out)
  * (active_paths >= 2) belongs to tcp_lane.c at flow creation — NOT
  * evaluated here; classify() applies only the static gates so it stays
  * pure and per-packet. */
+#define MQVPN_TCP_TRANSPARENT_PROTOCOL "mqvpn-tcp-transparent-v1"
+
 typedef struct {
     int enabled;
+    int transparent; /* preserve original TCP source; opt-in on both peers */
     mqvpn_hybrid_tcp_mode_t tcp_mode;
     uint32_t tcp_max_flows;           /* consumed by tcp_lane.c */
     uint32_t tcp_idle_timeout_sec;    /* consumed by tcp_lane.c (client) AND, since the

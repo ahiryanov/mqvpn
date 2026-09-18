@@ -139,6 +139,11 @@ typedef struct {
     uint64_t masque_stream_id;
     int tunnel_ready; /* ADDRESS_ASSIGN (v4) parsed from the response body */
     uint8_t assigned_ip[4];
+    const char *auth;
+    const char *source_ip;
+    const char *source_port;
+    int duplicate_source;
+    xqc_h3_request_t *tunnel_req;
     uint8_t body_buf[256];
     size_t body_len;
 
@@ -284,7 +289,7 @@ probe_open_request_with_body(probe_conn_t *p)
     if (!req) return -1;
 
     const char *path = p->path ? p->path : "/probe";
-    xqc_http_header_t hdrs[5] = {
+    xqc_http_header_t hdrs[9] = {
         {.name = {.iov_base = ":method", .iov_len = 7},
          .value = {.iov_base = "CONNECT", .iov_len = 7},
          .flags = 0},
@@ -301,7 +306,16 @@ probe_open_request_with_body(probe_conn_t *p)
          .value = {.iov_base = (void *)path, .iov_len = strlen(path)},
          .flags = 0},
     };
-    xqc_http_headers_t headers = {.headers = hdrs, .count = 5, .capacity = 5};
+    size_t count = 5;
+    if (p->auth) hdrs[count++] = (xqc_http_header_t){
+        .name = {"authorization", 13}, .value = {(void *)p->auth, strlen(p->auth)}};
+    if (p->source_ip) hdrs[count++] = (xqc_http_header_t){
+        .name = {"x-mqvpn-src-ip", 14}, .value = {(void *)p->source_ip, strlen(p->source_ip)}};
+    if (p->source_port) hdrs[count++] = (xqc_http_header_t){
+        .name = {"x-mqvpn-src-port", 16}, .value = {(void *)p->source_port, strlen(p->source_port)}};
+    if (p->duplicate_source) hdrs[count++] = (xqc_http_header_t){
+        .name = {"x-mqvpn-src-ip", 14}, .value = {(void *)p->source_ip, strlen(p->source_ip)}};
+    xqc_http_headers_t headers = {.headers = hdrs, .count = count, .capacity = 9};
 
     ssize_t ret = xqc_h3_request_send_headers(req, &headers, 0);
     if (ret < 0) return -1;
@@ -317,7 +331,7 @@ probe_open_connect_ip(probe_conn_t *p)
     xqc_h3_request_t *req = xqc_h3_request_create(p->engine, &p->cid, NULL, p);
     if (!req) return -1;
 
-    xqc_http_header_t hdrs[6] = {
+    xqc_http_header_t hdrs[7] = {
         {.name = {.iov_base = ":method", .iov_len = 7},
          .value = {.iov_base = "CONNECT", .iov_len = 7},
          .flags = 0},
@@ -338,9 +352,15 @@ probe_open_connect_ip(probe_conn_t *p)
          .flags = 0},
     };
     xqc_http_headers_t headers = {.headers = hdrs, .count = 6, .capacity = 6};
+    if (p->auth) {
+        hdrs[6] = (xqc_http_header_t){.name = {"authorization", 13},
+                                    .value = {(void *)p->auth, strlen(p->auth)}};
+        headers.count = headers.capacity = 7;
+    }
 
     if (xqc_h3_request_send_headers(req, &headers, 0) < 0) return -1;
     p->masque_stream_id = xqc_h3_stream_id(req);
+    p->tunnel_req = req;
     return 0;
 }
 
@@ -678,6 +698,8 @@ harness_egress_fd_unregister(int fd, void *user_ctx)
  * (nullable) runs on the server config after the fixed harness defaults and
  * before mqvpn_server_new — the seam tests use to exercise config-dependent
  * server behavior (e.g. the egress ACL) through the PUBLIC setter API. */
+static int harness_no_egress;
+
 static int
 harness_start(harness_t *h, const char *protocol, size_t protocol_len, int auto_open,
               void (*cfg_hook)(mqvpn_config_t *))
@@ -731,6 +753,7 @@ harness_start(harness_t *h, const char *protocol, size_t protocol_len, int auto_
         svr_cbs.tunnel_config_ready = noop_tunnel_config_ready;
         svr_cbs.egress_fd_register = harness_egress_fd_register;
         svr_cbs.egress_fd_unregister = harness_egress_fd_unregister;
+        if (harness_no_egress) svr_cbs.egress_fd_register = NULL;
 
         h->svr = mqvpn_server_new(svr_cfg, &svr_cbs, h);
         mqvpn_config_free(svr_cfg);
@@ -2890,10 +2913,139 @@ TEST(parse_path_accepts_v6_literal_45_chars)
     ASSERT_EQ(port, 443);
 }
 
+TEST(transparent_source_parser)
+{
+    const char *bad_ips[] = {"", "1.2.3", "256.1.2.3", "10.1.2.03", " 10.1.2.3",
+                             "10.1.2.3\r\n", "::1", "10.1.2.3,10.2.3.4"};
+    const char *bad_ports[] = {"", "0", "65536", "999999", "-1", "+1", "1 ", "1,2", "1\n"};
+    svr_req_headers_t h = {0};
+    struct sockaddr_in src;
+    xqc_http_header_t ip = {.name = {"x-mqvpn-src-ip", 14}, .value = {"10.111.252.25", 13}};
+    xqc_http_header_t port = {.name = {"x-mqvpn-src-port", 16}, .value = {"53000", 5}};
+    ASSERT_EQ(svr_tcp_parse_source(&h, &src), -1);
+    svr_tcp_source_header(&h, &ip);
+    ASSERT_EQ(svr_tcp_parse_source(&h, &src), -1);
+    svr_tcp_source_header(&h, &port);
+    ASSERT_EQ(svr_tcp_parse_source(&h, &src), 0);
+    ASSERT_EQ(ntohs(src.sin_port), 53000);
+    for (size_t i = 0; i < sizeof(bad_ips) / sizeof(bad_ips[0]); i++) {
+        h.src_ip = bad_ips[i]; h.src_ip_len = strlen(bad_ips[i]);
+        ASSERT_EQ(svr_tcp_parse_source(&h, &src), -1);
+    }
+    h.src_ip = "10.111.252.25"; h.src_ip_len = 13;
+    for (size_t i = 0; i < sizeof(bad_ports) / sizeof(bad_ports[0]); i++) {
+        h.src_port = bad_ports[i]; h.src_port_len = strlen(bad_ports[i]);
+        ASSERT_EQ(svr_tcp_parse_source(&h, &src), -1);
+    }
+    h.src_port = "65535"; h.src_port_len = 5;
+    ASSERT_EQ(svr_tcp_parse_source(&h, &src), 0);
+    h.src_port = "53\00000";
+    ASSERT_EQ(svr_tcp_parse_source(&h, &src), -1);
+    h.src_port = "53000";
+    h.src_ip = "10.1.2.3\000oops"; h.src_ip_len = 13;
+    ASSERT_EQ(svr_tcp_parse_source(&h, &src), -1);
+    h.src_ip = "10.111.252.25";
+    svr_tcp_source_header(&h, &ip);
+    ASSERT_EQ(svr_tcp_parse_source(&h, &src), -1);
+    h.src_ip_count = 1;
+    svr_tcp_source_header(&h, &port);
+    ASSERT_EQ(svr_tcp_parse_source(&h, &src), -1);
+    h.src_port_count = 1; h.tcp_headers_invalid = 1;
+    ASSERT_EQ(svr_tcp_parse_source(&h, &src), -1);
+}
+
+static void
+transparent_config(mqvpn_config_t *cfg)
+{
+    mqvpn_config_set_hybrid_transparent(cfg, 1);
+    mqvpn_config_add_user(cfg, "alice", "alice-key");
+    mqvpn_config_add_user(cfg, "bob", "bob-key");
+    mqvpn_config_set_auth_key(cfg, "global-key");
+    mqvpn_config_add_route(cfg, "alice", "10.111.252.0/22");
+    mqvpn_config_add_route(cfg, "bob", "10.111.253.0/24");
+    /* Destination permission must not grant source ownership. */
+    const char *allow[] = {"0.0.0.0/0"};
+    mqvpn_config_set_hybrid_egress_acl(cfg, allow, 1, NULL, 0);
+}
+
+TEST(transparent_source_h3_authorization)
+{
+    harness_t h;
+    harness_no_egress = 1; /* Accepted source reaches 503 before socket creation. */
+    ASSERT_EQ(harness_start(&h, MQVPN_TCP_TRANSPARENT_PROTOCOL,
+                            sizeof(MQVPN_TCP_TRANSPARENT_PROTOCOL) - 1, 0,
+                            transparent_config), 0);
+    harness_no_egress = 0;
+    probe_conn_t *p = &h.probe;
+    p->auth = "Bearer alice-key";
+    harness_pump(&h, &p->handshake_done, 10000);
+    ASSERT_EQ(probe_open_connect_ip(p), 0);
+    harness_pump(&h, &p->tunnel_ready, 10000);
+    ASSERT_EQ(p->tunnel_ready, 1);
+    char assigned[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, p->assigned_ip, assigned, sizeof(assigned));
+    struct { const char *ip, *port, *auth, *status; int duplicate; } cases[] = {
+        {assigned, "53000", "Bearer alice-key", "503", 0},
+        {"10.111.252.25", "53000", "Bearer alice-key", "503", 0},
+        {"10.111.253.25", "53000", "Bearer alice-key", "403", 0},
+        {"10.120.1.1", "53000", "Bearer alice-key", "403", 0},
+        {"8.8.8.8", "53000", "Bearer alice-key", "403", 0},
+        {"10.0.0.99", "53000", "Bearer alice-key", "403", 0},
+        {assigned, "53000", "Bearer bob-key", "403", 0},
+        {assigned, "53000", "Bearer global-key", "403", 0},
+        {assigned, "53000", "Bearer wrong-key", "403", 0},
+        {assigned, "53000", NULL, "403", 0},
+        {assigned, "0", "Bearer alice-key", "400", 0},
+        {"invalid", "53000", "Bearer alice-key", "400", 0},
+        {NULL, "53000", "Bearer alice-key", "400", 0},
+        {assigned, NULL, "Bearer alice-key", "400", 0},
+        {assigned, "53000", "Bearer alice-key", "400", 1},
+        {assigned, "53000", "Bearer alice-key", "503", 0},
+    };
+    /* xquic may defer close callbacks beyond a pump timeout. Each request's
+     * user-data remains distinct and alive through harness_stop. */
+    probe_conn_t flows[sizeof(cases) / sizeof(cases[0])];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        probe_conn_t *flow = &flows[i];
+        *flow = *p;
+        flow->path = "/.well-known/mqvpn/tcp/192.168.100.50/443/";
+        flow->auth = cases[i].auth; flow->source_ip = cases[i].ip;
+        flow->source_port = cases[i].port; flow->duplicate_source = cases[i].duplicate;
+        flow->response_done = 0; flow->status[0] = 0; flow->raw_capture = 1;
+        ASSERT_EQ(probe_open_request_with_body(flow), 0);
+        harness_pump(&h, &flow->response_done, 10000);
+        ASSERT_STREQ(flow->status, cases[i].status);
+        xqc_h3_request_close(flow->req);
+    }
+    /* A closed CONNECT-IP session cannot authorize new transparent requests. */
+    xqc_h3_request_close(p->tunnel_req);
+    int never = 0;
+    harness_pump(&h, &never, 200);
+    p->source_ip = assigned; p->source_port = "53000";
+    p->path = "/.well-known/mqvpn/tcp/192.168.100.50/443/";
+    p->raw_capture = 1; p->response_done = 0;
+    ASSERT_EQ(probe_open_request_with_body(p), 0);
+    harness_pump(&h, &p->response_done, 10000);
+    ASSERT_STREQ(p->status, "403");
+    harness_stop(&h);
+}
+
+TEST(transparent_protocol_disabled)
+{
+    char status[16];
+    ASSERT_EQ(run_dispatch_probe(MQVPN_TCP_TRANSPARENT_PROTOCOL,
+                                  sizeof(MQVPN_TCP_TRANSPARENT_PROTOCOL) - 1,
+                                  status, sizeof(status)), 0);
+    ASSERT_STREQ(status, "501");
+}
+
 int
 main(void)
 {
     printf("test_tcp_egress: server mqvpn-tcp dispatch tests\n");
+    run_transparent_source_parser();
+    run_transparent_source_h3_authorization();
+    run_transparent_protocol_disabled();
 
     run_unrecognized_protocol_gets_501();
     run_mqvpn_tcp_bad_path_gets_400();

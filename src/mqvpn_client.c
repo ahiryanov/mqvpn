@@ -1670,7 +1670,8 @@ cli_tcp_lane_open_stream(void *client_ctx, void *flow_handle, const mqvpn_flow_k
      * and deliberately NO capsule-protocol / mqvpn-reorder headers — the TCP
      * lane carries a raw byte relay, not capsules, and reorder is a
      * DATAGRAM-lane concern. */
-    xqc_http_header_t hdrs[6] = {
+    /* Five pseudo-headers, Bearer + x-user, and two source headers. */
+    xqc_http_header_t hdrs[9] = {
         {.name = {.iov_base = ":method", .iov_len = 7},
          .value = {.iov_base = "CONNECT", .iov_len = 7},
          .flags = 0},
@@ -1690,7 +1691,26 @@ cli_tcp_lane_open_stream(void *client_ctx, void *flow_handle, const mqvpn_flow_k
     int hdr_count = 5;
     hdr_count =
         cli_append_auth_header(c, hdrs, hdr_count, auth_value, sizeof(auth_value));
-    xqc_http_headers_t headers = {.headers = hdrs, .count = hdr_count, .capacity = 6};
+    char source_ip[INET6_ADDRSTRLEN], source_port[6];
+    if (c->config.hybrid.transparent) {
+        /* v1 is IPv4-only. Refuse the flow instead of silently losing source. */
+        if (key->ip_version != 4 ||
+            !inet_ntop(AF_INET, key->src_ip, source_ip, sizeof(source_ip))) {
+            xqc_h3_request_close(req);
+            return mqvpn_tcp_lane_abort_pending(flow_handle);
+        }
+        snprintf(source_port, sizeof(source_port), "%u", key->src_port);
+        hdrs[1].value = (struct iovec){
+            .iov_base = MQVPN_TCP_TRANSPARENT_PROTOCOL,
+            .iov_len = sizeof(MQVPN_TCP_TRANSPARENT_PROTOCOL) - 1};
+        hdrs[hdr_count++] = (xqc_http_header_t){
+            .name = {.iov_base = "x-mqvpn-src-ip", .iov_len = 14},
+            .value = {.iov_base = source_ip, .iov_len = strlen(source_ip)}};
+        hdrs[hdr_count++] = (xqc_http_header_t){
+            .name = {.iov_base = "x-mqvpn-src-port", .iov_len = 16},
+            .value = {.iov_base = source_port, .iov_len = strlen(source_port)}};
+    }
+    xqc_http_headers_t headers = {.headers = hdrs, .count = hdr_count, .capacity = 9};
 
     mqvpn_tcp_lane_bind_h3_request(flow_handle, req, stream);
 

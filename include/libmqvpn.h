@@ -667,6 +667,10 @@ MQVPN_API int mqvpn_config_add_reorder_rule(mqvpn_config_t *cfg, uint8_t proto,
 MQVPN_API int mqvpn_config_set_hybrid_enabled(mqvpn_config_t *cfg, int enabled);
 /* mode: 0=stream 1=raw 2=auto. Other values → MQVPN_ERR_INVALID_ARG. */
 MQVPN_API int mqvpn_config_set_hybrid_tcp_mode(mqvpn_config_t *cfg, int mode);
+
+/* Preserve original TCP source (IPv4). Opt-in on both peers; Linux egress
+ * requires IP_TRANSPARENT privileges and socket-match policy routing. */
+MQVPN_API int mqvpn_config_set_hybrid_transparent(mqvpn_config_t *cfg, int enabled);
 /* Limits for the future tcp_lane. tcp_max_flows must be > 0 (defaults:
  * 256 flows, 300 s idle timeout). On the CLIENT the effective cap is
  * additionally clamped at lane creation to half the lwIP pcb pool of the

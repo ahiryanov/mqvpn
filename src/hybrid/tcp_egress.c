@@ -28,6 +28,48 @@
 #define TCP_EGRESS_PATH_PREFIX     "/.well-known/mqvpn/tcp/"
 #define TCP_EGRESS_PATH_PREFIX_LEN (sizeof(TCP_EGRESS_PATH_PREFIX) - 1)
 
+void
+svr_tcp_source_header(svr_req_headers_t *out, const xqc_http_header_t *h)
+{
+    if (h->name.iov_len == 14 &&
+        memcmp(h->name.iov_base, "x-mqvpn-src-ip", 14) == 0) {
+        out->src_ip_count++;
+        out->src_ip = h->value.iov_base;
+        out->src_ip_len = h->value.iov_len;
+    }
+    if (h->name.iov_len == 16 &&
+        memcmp(h->name.iov_base, "x-mqvpn-src-port", 16) == 0) {
+        out->src_port_count++;
+        out->src_port = h->value.iov_base;
+        out->src_port_len = h->value.iov_len;
+    }
+}
+
+int
+svr_tcp_parse_source(const svr_req_headers_t *h, struct sockaddr_in *source)
+{
+    if (!h || !source || h->tcp_headers_invalid ||
+        h->src_ip_count != 1 || h->src_port_count != 1 ||
+        !h->src_ip || !h->src_port || !h->src_ip_len ||
+        h->src_ip_len >= INET_ADDRSTRLEN || !h->src_port_len ||
+        h->src_port_len > 5 || memchr(h->src_ip, '\0', h->src_ip_len)) return -1;
+    char ip[INET_ADDRSTRLEN];
+    memcpy(ip, h->src_ip, h->src_ip_len);
+    ip[h->src_ip_len] = '\0';
+    memset(source, 0, sizeof(*source));
+    source->sin_family = AF_INET;
+    if (inet_pton(AF_INET, ip, &source->sin_addr) != 1) return -1;
+    unsigned port = 0;
+    for (size_t i = 0; i < h->src_port_len; i++) {
+        unsigned char c = (unsigned char)h->src_port[i];
+        if (c < '0' || c > '9') return -1;
+        port = port * 10 + c - '0';
+    }
+    if (!port || port > 65535) return -1;
+    source->sin_port = htons((uint16_t)port);
+    return 0;
+}
+
 /* One relay-loop chunk (both directions) and the lazily-allocated stash
  * buffer size: a single in-flight chunk per direction, matching the
  * client's tcp_lane precedent (downlink_stash is TCP_MSS-sized there; here
@@ -322,6 +364,7 @@ typedef enum {
 
 typedef struct svr_tcp_egress_flow_s {
     int fd;
+    int transparent;
     xqc_h3_request_t *h3_request;
     void *stream; /* svr_stream_t*, opaque here — only mqvpn_server.c's
                    * accessors (svr_stream_tcp_egress_flow_ptr,
@@ -993,7 +1036,8 @@ svr_tcp_egress_fail_connect(mqvpn_server_t *server, svr_tcp_egress_flow_t *ef, i
 static int
 svr_tcp_egress_start_connect(mqvpn_server_t *server, void *stream,
                              xqc_h3_request_t *h3_request, const char *target_host,
-                             uint16_t target_port, const char *username)
+                             uint16_t target_port, const char *username,
+                             const struct sockaddr_in *source)
 {
     /* libmqvpn.h's documented contract: NULL egress callbacks => connect-tcp
      * gets 503. Checked FIRST, before the fd budget check and before the
@@ -1078,12 +1122,39 @@ svr_tcp_egress_start_connect(mqvpn_server_t *server, void *stream,
         dst_len = sizeof(*dst4);
     }
 
+    if (source) {
+#ifdef __linux__
+        int one = 1;
+        const char *op = "IP_TRANSPARENT";
+        int rc = setsockopt(fd, SOL_IP, IP_TRANSPARENT, &one, sizeof(one));
+        if (rc == 0) {
+            op = "bind";
+            /* No SO_REUSEADDR: collisions, including TIME_WAIT, fail closed.
+             * Never select a substitute port or a server-local source. */
+            rc = bind(fd, (const struct sockaddr *)source, sizeof(*source));
+        }
+        if (rc != 0) {
+            int err = errno;
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &source->sin_addr, ip, sizeof(ip));
+            TLOG_W(server, "connect-tcp: transparent %s failed src=%s:%u errno=%d user=%s",
+                   op, ip, ntohs(source->sin_port), err, username);
+            close(fd);
+            return svr_tcp_egress_respond(h3_request, 502, 1);
+        }
+#else
+        close(fd);
+        return svr_tcp_egress_respond(h3_request, 501, 1);
+#endif
+    }
+
     svr_tcp_egress_flow_t *ef = calloc(1, sizeof(*ef));
     if (!ef) {
         close(fd);
         return svr_tcp_egress_respond(h3_request, 500, 1);
     }
     ef->fd = fd;
+    ef->transparent = source != NULL;
     ef->h3_request = h3_request;
     ef->stream = stream;
     ef->state = EGRESS_FLOW_CONNECTING;
@@ -1149,6 +1220,32 @@ svr_tcp_egress_on_request(mqvpn_server_t *server, void *stream,
         return svr_tcp_egress_respond(h3_request, 403, 1);
     }
 
+    int transparent = svr_tcp_transparent_enabled(server);
+    int requested = hdrs->protocol_len == sizeof(MQVPN_TCP_TRANSPARENT_PROTOCOL) - 1 &&
+                    memcmp(hdrs->protocol, MQVPN_TCP_TRANSPARENT_PROTOCOL,
+                           sizeof(MQVPN_TCP_TRANSPARENT_PROTOCOL) - 1) == 0;
+    struct sockaddr_in source;
+    char source_ip[INET_ADDRSTRLEN];
+    if (requested && !transparent)
+        return svr_tcp_egress_respond(h3_request, 501, 1);
+    if (transparent) {
+#ifndef __linux__
+        return svr_tcp_egress_respond(h3_request, 501, 1);
+#endif
+        if (!requested || svr_tcp_parse_source(hdrs, &source) != 0) {
+            TLOG_W(server, "connect-tcp: transparent source metadata rejected user=%s", username);
+            return svr_tcp_egress_respond(h3_request, 400, 1);
+        }
+        inet_ntop(AF_INET, &source.sin_addr, source_ip, sizeof(source_ip));
+        if (!svr_auth_required(server) ||
+            !svr_tcp_source_authorized(stream, username, 4,
+                                       (const uint8_t *)&source.sin_addr)) {
+            TLOG_W(server, "connect-tcp: transparent source rejected user=%s src=%s",
+                   username, source_ip);
+            return svr_tcp_egress_respond(h3_request, 403, 1);
+        }
+    }
+
     /* The egress ACL below is unconditional regardless of auth: an open
      * (no-PSK) server still gets default-deny-private-ranges protection —
      * only the identity check is optional, not the network-reachability
@@ -1171,8 +1268,15 @@ svr_tcp_egress_on_request(mqvpn_server_t *server, void *stream,
         return svr_tcp_egress_respond(h3_request, 403, 1);
     }
 
+    if (transparent) {
+        if (strchr(target_host, ':'))
+            return svr_tcp_egress_respond(h3_request, 400, 1); /* v1: IPv4 only */
+        TLOG_I(server, "connect-tcp: transparent flow user=%s src=%s:%u dst=%s:%u",
+               username, source_ip, ntohs(source.sin_port), target_host, target_port);
+    }
+
     return svr_tcp_egress_start_connect(server, stream, h3_request, target_host,
-                                        target_port, username);
+                                        target_port, username, transparent ? &source : NULL);
 }
 
 /* H3 body-read notify. h3_request is unused once we have `ef` (the flow
@@ -1349,5 +1453,23 @@ svr_tcp_egress_destroy_all(mqvpn_server_t *server)
         svr_tcp_egress_flow_t *next = ef->next;
         svr_tcp_egress_flow_destroy(server, ef);
         ef = next;
+    }
+}
+
+void
+svr_tcp_egress_release_session(mqvpn_server_t *server, void *conn)
+{
+    if (!svr_tcp_transparent_enabled(server)) return;
+    svr_tcp_egress_srv_ctx_t ctx;
+    svr_get_tcp_egress_ctx(server, &ctx);
+    /* Restart after close: callbacks may reenter and destroy other flows. */
+    for (;;) {
+        svr_tcp_egress_flow_t *ef = *ctx.flow_list_head;
+        while (ef && (!ef->transparent || svr_stream_conn(ef->stream) != conn))
+            ef = ef->next;
+        if (!ef) break;
+        xqc_h3_request_t *request = ef->h3_request;
+        svr_tcp_egress_flow_destroy(server, ef);
+        xqc_h3_request_close(request);
     }
 }

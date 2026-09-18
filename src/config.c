@@ -773,6 +773,7 @@ static const cfg_key_desc_t cfg_keys[] = {
             reorder.egress_idle_timeout_sec),
     /* [Hybrid] — JSON side lives inside the bounded "hybrid" object */
     CFG_BOOL(SEC_HYBRID, "Enabled", "enabled", hybrid.enabled),
+    CFG_BOOL(SEC_HYBRID, "Transparent", "transparent", hybrid.transparent),
     {SEC_HYBRID, "Tcp", "tcp", CFGK_HYBRID_TCP_MODE, CFGK_OFF(hybrid.tcp_mode), 0, 0,
      NULL, 0, 0, NULL},
     CFG_U32(SEC_HYBRID, "TcpMaxFlows", "tcp_max_flows", hybrid.tcp_max_flows),

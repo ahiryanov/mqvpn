@@ -1202,6 +1202,10 @@ svr_check_session_invariants(const mqvpn_server_t *s)
 static void
 svr_session_release(mqvpn_server_t *s, svr_conn_t *conn)
 {
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+    /* Close foreign-bound sockets before releasing the session's address. */
+    svr_tcp_egress_release_session(s, conn);
+#endif
     /* Routes and ADDRESS_REQUEST IDs belong to this CONNECT-IP stream.
      * A subsequent tunnel on the same H3 connection starts a new history. */
     svr_routes_unbind_conn(s, conn);
@@ -1956,8 +1960,20 @@ svr_parse_request_headers(mqvpn_server_t *s, xqc_http_headers_t *headers,
 {
     memset(out, 0, sizeof(*out));
 
+    unsigned paths = 0, protocols = 0, auths = 0;
+
     for (int i = 0; i < (int)headers->count; i++) {
         xqc_http_header_t *h = &headers->headers[i];
+#ifdef MQVPN_HYBRID_TCP_EGRESS_ENABLED
+        svr_tcp_source_header(out, h);
+#endif
+        if (h->name.iov_len == 5 && memcmp(h->name.iov_base, ":path", 5) == 0)
+            paths++;
+        if (h->name.iov_len == 9 && memcmp(h->name.iov_base, ":protocol", 9) == 0)
+            protocols++;
+        if (h->name.iov_len == 13 && memcmp(h->name.iov_base, "authorization", 13) == 0)
+            auths++;
+        out->tcp_headers_invalid = paths > 1 || protocols > 1 || auths > 1;
         if (h->name.iov_len == 7 && memcmp(h->name.iov_base, ":method", 7) == 0 &&
             h->value.iov_len == 7 && memcmp(h->value.iov_base, "CONNECT", 7) == 0)
             out->is_connect = 1;
@@ -2782,8 +2798,11 @@ cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t flag,
          * is treated exactly like an unrecognized protocol: fall through to
          * the 501 below rather than a dedicated status, since the server
          * offers no such capability right now. */
-        if (hdrs.is_connect && hdrs.protocol_len == 9 &&
-            memcmp(hdrs.protocol, "mqvpn-tcp", 9) == 0 && s->config.hybrid.enabled) {
+        if (hdrs.is_connect && s->config.hybrid.enabled &&
+            ((hdrs.protocol_len == 9 && memcmp(hdrs.protocol, "mqvpn-tcp", 9) == 0) ||
+             (hdrs.protocol_len == sizeof(MQVPN_TCP_TRANSPARENT_PROTOCOL) - 1 &&
+              memcmp(hdrs.protocol, MQVPN_TCP_TRANSPARENT_PROTOCOL,
+                     sizeof(MQVPN_TCP_TRANSPARENT_PROTOCOL) - 1) == 0))) {
             stream->role = SVR_STREAM_ROLE_CONNECT_TCP;
             return svr_tcp_egress_on_request(s, stream, h3_request, &hdrs);
         }
@@ -2905,20 +2924,14 @@ cb_request_closing_notify(xqc_h3_request_t *h3_request, xqc_int_t err,
  * LPM owner (not merely any covering row for this user) must equal the
  * immutable per-user auth principal. */
 static int
-svr_inner_source_authorized(const svr_conn_t *conn, const uint8_t *pkt, size_t len)
+svr_source_authorized(const svr_conn_t *conn, uint8_t family, const uint8_t *source)
 {
-    if (!conn || !pkt || len < 1) return 0;
+    if (!conn || !source) return 0;
     const mqvpn_server_t *s = conn->server;
-    uint8_t family = pkt[0] >> 4;
-    uint8_t source[16] = {0};
 
     if (family == 4) {
-        if (len < 20) return 0;
-        memcpy(source, pkt + 12, 4);
         if (memcmp(source, &conn->assigned_ip.s_addr, 4) == 0) return 1;
     } else if (family == 6) {
-        if (len < 40) return 0;
-        memcpy(source, pkt + 8, 16);
         if (conn->has_v6 && memcmp(source, &conn->assigned_ip6, 16) == 0) return 1;
     } else {
         return 0;
@@ -2930,6 +2943,43 @@ svr_inner_source_authorized(const svr_conn_t *conn, const uint8_t *pkt, size_t l
     int route_idx = svr_route_lpm(s, family, source);
     return route_idx >= 0 &&
            strcmp(s->config.route_users[route_idx], conn->auth_principal) == 0;
+}
+
+static int
+svr_inner_source_authorized(const svr_conn_t *conn, const uint8_t *pkt, size_t len)
+{
+    if (!pkt || !len) return 0;
+    if (pkt[0] >> 4 == 4 && len >= 20)
+        return svr_source_authorized(conn, 4, pkt + 12);
+    if (pkt[0] >> 4 == 6 && len >= 40)
+        return svr_source_authorized(conn, 6, pkt + 8);
+    return 0;
+}
+
+int
+svr_tcp_transparent_enabled(const mqvpn_server_t *s)
+{
+    return s->config.hybrid.transparent;
+}
+
+void *
+svr_stream_conn(void *stream)
+{
+    return stream ? ((svr_stream_t *)stream)->conn : NULL;
+}
+
+int
+svr_tcp_source_authorized(void *stream, const char *username,
+                          uint8_t family, const uint8_t *source)
+{
+    const svr_conn_t *conn = svr_stream_conn(stream);
+    if (!conn || !conn->tunnel_established || !conn->assigned_ip.s_addr ||
+        !conn->connected_at_us || !username) return 0;
+    /* Display x-user is never an identity. A global-key session can use only
+     * its assigned address; routed sources require a personal-key principal. */
+    const char *principal = conn->auth_principal[0] ? conn->auth_principal : "(global)";
+    if (strcmp(username, principal) != 0) return 0;
+    return svr_source_authorized(conn, family, source);
 }
 
 /*

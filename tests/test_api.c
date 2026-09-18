@@ -793,6 +793,12 @@ TEST(config_set_hybrid)
     /* Defaults from mqvpn_hybrid_config_default() */
     ASSERT_EQ(cfg->hybrid.enabled, 0);
     ASSERT_EQ(cfg->hybrid.tcp_mode, MQVPN_HYBRID_TCP_AUTO);
+    ASSERT_EQ(cfg->hybrid.transparent, 0);
+    ASSERT_EQ(mqvpn_config_set_hybrid_transparent(cfg, 1), MQVPN_OK);
+    ASSERT_EQ(cfg->hybrid.transparent, 1);
+    ASSERT_EQ(mqvpn_config_set_hybrid_transparent(cfg, 0), MQVPN_OK);
+    ASSERT_EQ(cfg->hybrid.transparent, 0);
+    ASSERT_EQ(mqvpn_config_set_hybrid_transparent(NULL, 1), MQVPN_ERR_INVALID_ARG);
     ASSERT_EQ(cfg->hybrid.tcp_max_flows, 256);
     ASSERT_EQ(cfg->hybrid.tcp_idle_timeout_sec, 300);
 

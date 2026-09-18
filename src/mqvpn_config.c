@@ -1105,6 +1105,14 @@ mqvpn_config_set_hybrid_enabled(mqvpn_config_t *cfg, int enabled)
 }
 
 int
+mqvpn_config_set_hybrid_transparent(mqvpn_config_t *cfg, int enabled)
+{
+    if (!cfg) return MQVPN_ERR_INVALID_ARG;
+    cfg->hybrid.transparent = enabled ? 1 : 0;
+    return MQVPN_OK;
+}
+
+int
 mqvpn_config_set_hybrid_tcp_mode(mqvpn_config_t *cfg, int mode)
 {
     if (!cfg) return MQVPN_ERR_INVALID_ARG;

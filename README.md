@@ -429,10 +429,12 @@ LAN initiates Hybrid TCP toward an RFC1918 central network, add that central
 CIDR to the server's repeated `[Hybrid] EgressAllow` list; the existing egress
 ACL otherwise denies private destinations by default.
 
-Hybrid TCP stream mode opens a new TCP connection from the server, so the
-destination sees the server's source address. For transparent routing that
-preserves LAN source addresses, set `[Hybrid] Tcp = raw` on the client (or
-disable Hybrid). Update both endpoints to this routed-network implementation;
+By default Hybrid TCP stream mode opens a connection with the server's source
+address. To preserve the original LAN source IP and TCP port while retaining
+H3 STREAM, enable `[Hybrid] Transparent = true` on both peers and configure
+[Transparent Hybrid TCP return routing](docs/transparent-hybrid-tcp.md) on the
+Linux server (IPv4). `Tcp = raw` or disabling Hybrid also preserves source
+addresses through CONNECT-IP. Update both endpoints to this routed-network implementation;
 older clients do not process the additional source prefixes.
 
 ## Schedulers

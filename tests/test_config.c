@@ -2183,6 +2183,7 @@ test_hybrid_defaults_when_absent(void)
     mqvpn_config_defaults(&cfg);
     ASSERT_EQ_INT(cfg.hybrid.enabled, 0, "hybrid default enabled off");
     ASSERT_EQ_INT(cfg.hybrid.tcp_mode, MQVPN_HYBRID_TCP_AUTO, "hybrid default tcp auto");
+    ASSERT_EQ_INT(cfg.hybrid.transparent, 0, "transparent default false");
     ASSERT_EQ_INT((int)cfg.hybrid.tcp_max_flows, 256, "hybrid default tcp_max_flows");
     ASSERT_EQ_INT((int)cfg.hybrid.tcp_idle_timeout_sec, 300,
                   "hybrid default tcp_idle_timeout_sec");
@@ -2228,11 +2229,12 @@ test_hybrid_section_parse(void)
     ASSERT_EQ_INT((int)cfg.hybrid.tcp_idle_timeout_sec, 60, "hybrid ini idle timeout");
 
     /* Tcp mode value is case-insensitive (mirrors reorder Enabled=/Profile=) */
-    p = write_tmp("[Hybrid]\nTcp = STREAM\n");
+    p = write_tmp("[Hybrid]\nTcp = STREAM\nTransparent = true\n");
     mqvpn_config_defaults(&cfg);
     rc = mqvpn_config_load(&cfg, p);
     unlink(p);
     ASSERT_EQ_INT(rc, 0, "hybrid ini stream load ok");
+    ASSERT_EQ_INT(cfg.hybrid.transparent, 1, "transparent ini true");
     ASSERT_EQ_INT(cfg.hybrid.tcp_mode, MQVPN_HYBRID_TCP_STREAM,
                   "hybrid ini tcp STREAM case-insensitive");
 
@@ -2240,11 +2242,13 @@ test_hybrid_section_parse(void)
     mqvpn_config_defaults(&cfg);
     rc = mqvpn_config_load_json_filecfg(&cfg, "{\"hybrid\":{"
                                               "\"enabled\":true,"
+                                              "\"transparent\":true,"
                                               "\"tcp\":\"raw\","
                                               "\"tcp_max_flows\":128,"
                                               "\"tcp_idle_timeout_sec\":60"
                                               "}}");
     ASSERT_EQ_INT(rc, 0, "hybrid json load ok");
+    ASSERT_EQ_INT(cfg.hybrid.transparent, 1, "transparent json true");
     ASSERT_EQ_INT(cfg.hybrid.enabled, 1, "hybrid json enabled");
     ASSERT_EQ_INT(cfg.hybrid.tcp_mode, MQVPN_HYBRID_TCP_RAW, "hybrid json tcp raw");
     ASSERT_EQ_INT((int)cfg.hybrid.tcp_max_flows, 128, "hybrid json tcp_max_flows");

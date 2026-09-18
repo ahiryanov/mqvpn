@@ -16,6 +16,13 @@
 #include <xquic/xquic.h>
 #include <xquic/xqc_http3.h>
 
+#include <netinet/in.h>
+
+/* Shared wire parser: length-bounded, duplicate-aware, IPv4 only for v1. */
+void svr_tcp_source_header(svr_req_headers_t *out, const xqc_http_header_t *h);
+int svr_tcp_parse_source(const svr_req_headers_t *hdrs, struct sockaddr_in *source);
+void svr_tcp_egress_release_session(mqvpn_server_t *server, void *conn);
+
 /* Called from cb_request_read's header path once :protocol==mqvpn-tcp and
  * hdrs.is_connect are confirmed. Owns the full request lifecycle from here:
  * auth (reusing svr_auth_check) -> ACL -> connect -> relay.
