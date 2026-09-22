@@ -120,6 +120,25 @@ TEST(single_primary_among_backups_no_rotation)
     ASSERT_EQ(mqvpn_rotate_primary_path(1, f, 4), 1);
 }
 
+/* Removing lo leaves wwan1 as the sole primary. tick_reconnect marks
+ * detached slots BACKUP in its flags view before calling rotation. */
+TEST(removed_primary_selects_only_remaining_path)
+{
+    uint32_t f[2];
+    make_flags("BP", f, 2);
+    ASSERT_EQ(mqvpn_rotate_primary_path(0, f, 2), 1);
+    ASSERT_EQ(mqvpn_rotate_primary_path(1, f, 2), 1);
+}
+
+/* The sole eligible path may precede the removed path in the slot array. */
+TEST(removed_primary_wraps_to_only_remaining_path)
+{
+    uint32_t f[4];
+    make_flags("BPBB", f, 4);
+    ASSERT_EQ(mqvpn_rotate_primary_path(2, f, 4), 1);
+    ASSERT_EQ(mqvpn_rotate_primary_path(3, f, 4), 1);
+}
+
 /* All backup: cur_idx is unchanged (degenerate config) */
 TEST(all_backup_no_rotation)
 {
@@ -169,6 +188,8 @@ main(void)
     run_backup_first_is_skipped();
     run_backup_last_is_skipped();
     run_single_primary_among_backups_no_rotation();
+    run_removed_primary_selects_only_remaining_path();
+    run_removed_primary_wraps_to_only_remaining_path();
     run_all_backup_no_rotation();
     run_issue_4257_first_dead_rotates_to_second();
     run_four_primaries_full_cycle();

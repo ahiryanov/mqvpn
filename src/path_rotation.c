@@ -14,7 +14,7 @@ mqvpn_rotate_primary_path(int cur_idx, const uint32_t *path_flags, int n_paths)
     for (int i = 0; i < n_paths; i++)
         if (!(path_flags[i] & MQVPN_PATH_FLAG_BACKUP)) n_primary++;
 
-    if (n_primary <= 1) return cur_idx; /* nothing to rotate to */
+    if (n_primary == 0) return cur_idx; /* no eligible path */
 
     /* Walk forward from cur_idx+1, wrapping, until we find a non-backup path */
     int next = (cur_idx + 1) % n_paths;
