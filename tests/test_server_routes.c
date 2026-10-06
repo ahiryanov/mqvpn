@@ -5,6 +5,7 @@
  * only to simulate a malicious client: traffic still crosses QUIC and the
  * production server's source gate. No TUN device or root privileges needed. */
 #include "libmqvpn.h"
+#include "mqvpn_bind_posix.h"
 #include <arpa/inet.h>
 #include <poll.h>
 #include <stdio.h>
@@ -184,7 +185,12 @@ open_peer(int index, const char *key, const char *name, int accepted)
     mqvpn_path_desc_t desc = {.struct_size = sizeof(desc)};
     memcpy(desc.local_addr, &addr, sizeof(addr));
     desc.local_addr_len = sizeof(addr);
-    p->path = mqvpn_client_add_path_fd(p->client, p->fd, &desc);
+    void *tctx = NULL;
+    mqvpn_bind_posix_opts_t opts = {0};
+    opts.struct_size = sizeof(opts);
+    opts.socket_buf_bytes = -1;
+    CHECK(mqvpn_bind_posix_path_new(p->fd, &opts, &tctx) == MQVPN_OK);
+    p->path = mqvpn_client_add_path(p->client, &desc, mqvpn_bind_posix_path_ops(), tctx, NULL);
     CHECK(p->path != (mqvpn_path_handle_t)-1);
     CHECK(mqvpn_client_set_server_addr(p->client, (struct sockaddr *)&server_addr,
                                        sizeof(server_addr)) == MQVPN_OK);
@@ -338,8 +344,13 @@ main(void)
     server = mqvpn_server_new(cfg, &cbs, NULL);
     mqvpn_config_free(cfg);
     CHECK(server);
-    CHECK(mqvpn_server_set_socket_fd(server, server_fd, (struct sockaddr *)&server_addr,
-                                     sizeof(server_addr)) == MQVPN_OK);
+    void *tctx = NULL;
+    mqvpn_bind_posix_opts_t opts = {0};
+    opts.struct_size = sizeof(opts);
+    opts.socket_buf_bytes = -1;
+    CHECK(mqvpn_bind_posix_server_new(server_fd, &opts, &tctx) == MQVPN_OK);
+    CHECK(mqvpn_server_set_transport(server, mqvpn_bind_posix_server_ops(), tctx,
+                                    (struct sockaddr *)&server_addr, sizeof(server_addr)) == MQVPN_OK);
     CHECK(mqvpn_server_start(server) == MQVPN_OK);
 
     /* A global-key holder cannot take the named user's pin or routes. */

@@ -723,7 +723,7 @@ main(int argc, char **argv)
         g_invalid_auth = 0;
         pump_cond_ctx_t rejected_cond = {
             .svr = svr, .min_clients = -1, .eq_clients = -1, .req = &rejected_ctx};
-        pump_until(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &rejected_cond);
+        pump_until(svr, svr_tctx, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &rejected_cond);
         if (rejected_ctx.status != 403) rc = 1;
     }
 
@@ -778,7 +778,7 @@ main(int argc, char **argv)
 
     if (rejected && !rejected_ctx.closed) {
         xqc_h3_request_close(rejected);
-        pump_wait(svr, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &rejected_ctx.closed);
+        pump_wait(svr, svr_tctx, svr_fd, &cli_addr, cli_fd, PUMP_BUDGET_ITERS, &rejected_ctx.closed);
     }
 
     if (rc == 0) {

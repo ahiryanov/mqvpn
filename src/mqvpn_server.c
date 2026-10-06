@@ -1525,11 +1525,9 @@ svr_send_address_assign_snapshot(xqc_h3_request_t *h3_request, svr_conn_t *conn,
     APPEND_UNSOLICITED_ADDRESS(4, ip4, sizeof(ip4), 32);
 
     if (conn->has_v6) {
-        /* Legacy compatibility: mqvpn's platform callback derives the
-         * interface prefix from this primary entry, so it still carries the
-         * configured tunnel prefix rather than /128. */
-        APPEND_UNSOLICITED_ADDRESS(6, &conn->assigned_ip6, 16,
-                                   (uint8_t)s->pool.prefix6);
+        /* Assign only this host on the wire (RFC 9484 section 4.7.1).
+         * The client derives its interface width locally, as in upstream. */
+        APPEND_UNSOLICITED_ADDRESS(6, &conn->assigned_ip6, 16, 128);
     }
 
     if (conn->auth_principal[0]) {
@@ -1551,11 +1549,9 @@ svr_send_address_assign_snapshot(xqc_h3_request_t *h3_request, svr_conn_t *conn,
         uint8_t prefix = 32;
         if (family == 6) {
             if (conn->has_v6) {
-                /* Match the legacy primary tuple exactly.  Sending the same
-                 * host once with its interface prefix and again as /128 would
-                 * be a contradictory primary replay at the receiver. */
+                /* A solicited replay must match the primary host assignment. */
                 addr = (const uint8_t *)&conn->assigned_ip6;
-                prefix = (uint8_t)s->pool.prefix6;
+                prefix = 128;
             } else {
                 /* RFC 9484's explicit address-request rejection. */
                 addr = zero6;

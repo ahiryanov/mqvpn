@@ -502,12 +502,16 @@ probe_cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t fl
                                           &cap_payload, &cap_len, &consumed) != XQC_OK)
                 break;
             if (cap_type == XQC_H3_CAPSULE_ADDRESS_ASSIGN) {
-                uint64_t req_id;
-                uint8_t ip_ver, ip_addr[16], prefix;
-                size_t ip_len = 16, aa_consumed;
-                if (xqc_h3_ext_connectip_parse_address_assign(
-                        cap_payload, cap_len, &req_id, &ip_ver, ip_addr, &ip_len, &prefix,
-                        &aa_consumed) == XQC_OK) {
+                size_t off = 0;
+                while (off < cap_len) {
+                    uint64_t req_id;
+                    uint8_t ip_ver, ip_addr[16], prefix;
+                    size_t ip_len = 16, aa_consumed = 0;
+                    if (xqc_h3_ext_connectip_parse_address_assign(
+                            cap_payload + off, cap_len - off, &req_id, &ip_ver,
+                            ip_addr, &ip_len, &prefix, &aa_consumed) != XQC_OK ||
+                        aa_consumed == 0)
+                        break;
                     if (ip_ver == 4) {
                         memcpy(p->assigned_ip, ip_addr, 4);
                         p->tunnel_ready = 1;
@@ -515,6 +519,7 @@ probe_cb_request_read(xqc_h3_request_t *h3_request, xqc_request_notify_flag_t fl
                         p->assigned_prefix6 = prefix;
                         p->assigned6_seen = 1;
                     }
+                    off += aa_consumed;
                 }
             }
             if (consumed < p->body_len)
