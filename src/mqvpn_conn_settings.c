@@ -159,6 +159,10 @@ mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t *in, xqc_conn_settin
      * multipath FIXME) then marks a path with an empty buffer app-limited,
      * so BBR stops raising its bandwidth estimate. */
     out->max_stream_unsent_packets = MQVPN_STREAM_UNSENT_PACKETS;
+    /* Hold QUIC receive credit for unread H3 DATA. A stalled inner TCP
+     * receiver must backpressure the peer, not fill anonymous memory.
+     * Bound initial credit too: 16 MiB per stream, 32 MiB per connection. */
+    out->h3_body_recv_window = 16 * 1024 * 1024;
 
     /* Caller-gated, never derived here: see the field comment in
      * mqvpn_conn_settings.h for why this must equal the batched-send

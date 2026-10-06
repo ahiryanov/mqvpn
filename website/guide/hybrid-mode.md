@@ -84,3 +84,18 @@ numbers are in
 - **TCP to private targets needs an explicit `EgressAllow`.** The client cannot see the server's ACL, so lwIP answers the inner SYN locally before the server's egress `connect()` is attempted; an ACL denial surfaces to the app as a later RST rather than an immediate connection refusal.
 - **Client-address pools wider than `/24` can deny intra-VPN TCP between clients.** The client only exempts its own `/24` from the TCP lane; with a wider pool, add an `EgressAllow` covering the pool (the server logs a startup warning for this case).
 - A handful of IPv6 forms lwIP cannot deliver (v4-mapped, multicast, unspecified source) are routed to the raw lane instead of the TCP lane.
+
+## Receive backpressure
+
+Unread HTTP/3 bodies now retain the peer's receive credit. If an inner TCP
+receiver stops reading, the sender eventually stops sending over the VPN;
+reading again resumes the same transfer. The receive window is 16 MiB per
+stream and at most 32 MiB across one QUIC connection, plus a small parser
+allowance. These bound receive credit, not total process memory: lwIP, kernel
+sockets, packets, metadata and other connections also use memory. Several
+stalled streams can fill the shared window and temporarily delay other H3
+streams on that connection. Datagram traffic does not use this credit.
+
+This requires mqvpn and its pinned xquic to be rebuilt together on both peers.
+It does not impose a fixed LTE sending rate. The default xquic setting remains
+legacy-compatible for applications that do not enable this mechanism.
