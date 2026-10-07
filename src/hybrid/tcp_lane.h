@@ -150,6 +150,28 @@ typedef struct {
                                   * currently in the table — surfaced through
                                   * mqvpn_client_get_stats as the public
                                   * raw_markers_active stat */
+    /* On-demand gauges and per-lane cumulative relay counters. */
+    uint64_t pending_accept;
+    uint64_t pending_stream;
+    uint64_t established;
+    uint64_t closing;
+    uint64_t downlink_paused;
+    uint64_t uplink_withheld;
+    uint64_t downlink_stash_bytes;
+    uint64_t uplink_queued_bytes;
+    uint64_t downlink_pause_max_ms;
+    uint64_t downlink_h3_bytes;
+    uint64_t downlink_tcp_bytes;
+    uint64_t downlink_acked_bytes;
+    uint64_t downlink_pause_events;
+    uint64_t downlink_resume_events;
+    uint64_t downlink_retry_calls;
+    uint64_t downlink_sndbuf_blocks;
+    uint64_t downlink_err_mem;
+    uint64_t downlink_h3_again;
+    uint64_t downlink_queue_blocks;
+    uint64_t downlink_queued_pbufs;
+    uint64_t pressure_evicted;
 } mqvpn_tcp_lane_stats_t;
 
 /* client_ctx is opaque to tcp_lane.c's callers outside mqvpn_client.c; it is
@@ -534,6 +556,12 @@ uint32_t mqvpn_tcp_lane_marker_isn(mqvpn_tcp_lane_t *lane, const mqvpn_flow_key_
 /* Idle-timeout sweep + CLOSING grace-sweep + stats snapshot, called from
  * tick() (C1). */
 void mqvpn_tcp_lane_tick(mqvpn_tcp_lane_t *lane, uint64_t now_us);
+/* Under aggregate receive-credit pressure, abort at most one oldest paused
+ * receiver without ACK progress: 5 s with zero TCP window, otherwise 30 s.
+ * Caller allows engine progress, resamples credit, and gates to 8 Hz; never
+ * abort an ordinary idle connection or a progressing receiver. */
+int mqvpn_tcp_lane_relieve_pressure(mqvpn_tcp_lane_t *lane, uint64_t now_us,
+                                    uint64_t credit, uint64_t pending);
 void mqvpn_tcp_lane_get_stats(const mqvpn_tcp_lane_t *lane, mqvpn_tcp_lane_stats_t *out);
 
 /* Effective concurrent-flow cap after lane_new's pcb-pool clamp

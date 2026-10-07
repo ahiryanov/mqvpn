@@ -67,6 +67,12 @@ test_asymmetry_server_vs_client(void)
     ASSERT_EQ(srv.h3_body_recv_window, 16 * 1024 * 1024);
     ASSERT_EQ(cli_mp_on.h3_body_recv_window, 16 * 1024 * 1024);
     ASSERT_EQ(cli_mp_off.h3_body_recv_window, 16 * 1024 * 1024);
+    ASSERT_EQ(srv.h3_body_stream_recv_window, 16 * 1024 * 1024);
+    ASSERT_EQ(srv.h3_body_stream_initial_window, 64 * 1024);
+    ASSERT_EQ(cli_mp_on.h3_body_stream_recv_window, 16 * 1024 * 1024);
+    ASSERT_EQ(cli_mp_on.h3_body_stream_initial_window, 64 * 1024);
+    ASSERT_EQ(cli_mp_off.h3_body_stream_recv_window, 16 * 1024 * 1024);
+    ASSERT_EQ(cli_mp_off.h3_body_stream_initial_window, 64 * 1024);
 
     /* Server side: MP always on, grant capped at 64, ping_on absent. */
     ASSERT_EQ(srv.enable_multipath, 1);

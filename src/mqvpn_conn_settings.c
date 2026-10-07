@@ -161,8 +161,15 @@ mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t *in, xqc_conn_settin
     out->max_stream_unsent_packets = MQVPN_STREAM_UNSENT_PACKETS;
     /* Hold QUIC receive credit for unread H3 DATA. A stalled inner TCP
      * receiver must backpressure the peer, not fill anonymous memory.
-     * Bound initial credit too: 16 MiB per stream, 32 MiB per connection. */
+     * Bound aggregate initial credit to 32 MiB; the smaller stream window
+     * below isolates receivers instead of allocating half the tunnel each. */
     out->h3_body_recv_window = 16 * 1024 * 1024;
+    /* Start small so new non-readers cannot each retain a large WAN BDP.
+     * Fast application consumption autotunes up to the original 16 MiB
+     * ceiling; the independent 32 MiB aggregate bound stays intact.
+     * Never impose the old fixed 256 KiB throughput ceiling on fast flows. */
+    out->h3_body_stream_initial_window = 64 * 1024;
+    out->h3_body_stream_recv_window = 16 * 1024 * 1024;
 
     /* Caller-gated, never derived here: see the field comment in
      * mqvpn_conn_settings.h for why this must equal the batched-send

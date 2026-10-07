@@ -332,7 +332,15 @@ cli_tcp_lane_h3_recv(void *h3_request, uint8_t *buf, size_t len, int *fin)
     if (e->special == 1) return MQVPN_TCP_LANE_H3_RECV_AGAIN;
     if (e->special == 2) return MQVPN_TCP_LANE_H3_RECV_ERR;
     size_t n = e->len;
-    if (n > len) n = len; /* test chunks are always <= the TCP_MSS scratch buffer */
+    if (n > len) {
+        n = len;
+        g_h3_recv_script_pos--; /* recv_body preserves unread suffixes */
+        e->data += n;
+        e->len -= n;
+        memcpy(buf, e->data - n, n);
+        *fin = 0;
+        return (ssize_t)n;
+    }
     if (n > 0 && e->data) {
         memcpy(buf, e->data, n);
     }
@@ -2048,6 +2056,207 @@ test_relay_fin_during_pending_stream(void)
  * mk_pbuf — the "source" is a scripted H3 recv_body delivery, not a pbuf). */
 
 static void
+test_stream_diagnostic_pause_and_resume(void)
+{
+    relay_reset();
+    g_fake_now = 1000000;
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0xdc01, NULL, fake_clock, NULL);
+    struct tcp_pcb pcb;
+    int req, stream;
+    mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb, 7901, &req, &stream, 1);
+    ASSERT_TRUE(f != NULL, "diagnostic flow established");
+    mqvpn_tcp_lane_stats_t st;
+    mqvpn_tcp_lane_get_stats(lane, &st);
+    ASSERT_EQ_INT(st.established, 1, "established gauge");
+    ASSERT_EQ_INT(st.downlink_paused, 0, "no initial pause");
+
+    h3_recv_push_data(mk_dl_bytes(400), 400, 0);
+    tw_script_push(ERR_MEM);
+    mqvpn_tcp_lane_downlink_pump(lane, &stream);
+    g_fake_now += 2500000;
+    tw_script_push(ERR_MEM);
+    mqvpn_tcp_lane_downlink_pump(lane, &stream);
+    mqvpn_tcp_lane_get_stats(lane, &st);
+    ASSERT_EQ_INT(st.downlink_paused, 1, "paused gauge");
+    ASSERT_EQ_INT(st.downlink_stash_bytes, 400, "stash bytes");
+    ASSERT_EQ_INT(st.downlink_h3_bytes, 400, "H3 consumed once");
+    ASSERT_EQ_INT(st.downlink_tcp_bytes, 0, "failed writes not progress");
+    ASSERT_EQ_INT(st.downlink_err_mem, 2, "both ERR_MEM attempts counted");
+    ASSERT_EQ_INT(st.downlink_retry_calls, 1, "one retry");
+    ASSERT_EQ_INT(st.downlink_pause_events, 1, "retry is not a new pause");
+    ASSERT_EQ_INT(st.downlink_pause_max_ms, 2500, "retry never resets age");
+    mqvpn_tcp_lane_get_stats(lane, &st);
+    ASSERT_EQ_INT(st.downlink_paused, 1, "repeated snapshot not accumulated");
+
+    g_fake_now = 500000; /* clock regression cannot underflow age */
+    mqvpn_tcp_lane_get_stats(lane, &st);
+    ASSERT_EQ_INT(st.downlink_pause_max_ms, 0, "age clamps on clock regression");
+    g_fake_now = 4000000;
+    mqvpn_tcp_lane_downlink_pump(lane, &stream);
+    mqvpn_tcp_lane_on_lwip_sent(f, &pcb, 400);
+    mqvpn_tcp_lane_get_stats(lane, &st);
+    ASSERT_EQ_INT(st.downlink_paused, 0, "resumed gauge");
+    ASSERT_EQ_INT(st.downlink_pause_max_ms, 0, "pause age cleared");
+    ASSERT_EQ_INT(st.downlink_stash_bytes, 0, "stash drained");
+    ASSERT_EQ_INT(st.downlink_tcp_bytes, 400, "successful retry is progress");
+    ASSERT_EQ_INT(st.downlink_acked_bytes, 400, "only acknowledged bytes");
+    ASSERT_EQ_INT(st.downlink_resume_events, 1, "one resume");
+    ASSERT_EQ_INT(st.downlink_retry_calls, 2, "both retries counted");
+    f->pcb = NULL;
+    mqvpn_tcp_lane_free(lane);
+}
+
+static void
+test_pressure_reclaims_only_old_paused_receiver(void)
+{
+    relay_reset();
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0xdc09, NULL, fake_clock, NULL);
+    struct tcp_pcb pcb[3];
+    int req[3], stream[3];
+    mqvpn_tcp_flow_t *f[3];
+    for (int i = 0; i < 3; i++) {
+        f[i] = setup_flow(lane, &pcb[i], 7980 + i, &req[i], &stream[i], 1);
+        ASSERT_TRUE(f[i] != NULL, "pressure fixture");
+        pcb[i].snd_wnd = 65535;
+    }
+    f[0]->downlink_paused = f[1]->downlink_paused = 1;
+    f[0]->downlink_pause_since_us = 1000000;
+    f[1]->downlink_pause_since_us = 5000000;
+    ASSERT_EQ_INT(
+        mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 8 * 1024 * 1024, 32000000), 0,
+        "healthy credit preserves paused flows");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 0, 1000), 0,
+                  "transport-only pressure does not reset LAN receivers");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 30000000, 0, 32000000), 0,
+                  "transient pause preserved");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 31000000, 0, 32000000), 1,
+                  "oldest continuously paused receiver removed");
+    ASSERT_TRUE(g_tcp_abort_last_pcb == &pcb[0], "right PCB aborted");
+    ASSERT_TRUE(g_h3_close_last_req == &req[0], "right H3 request cancelled");
+    ASSERT_EQ_INT(g_tcp_abort_calls, 1, "one abort, not whole tunnel");
+    ASSERT_EQ_INT(g_h3_close_calls, 1, "one H3 close");
+    ASSERT_EQ_INT(lane->n_tcp_flows, 2, "other flows retained");
+    ASSERT_EQ_INT(lane->stats.pressure_evicted, 1, "observable pressure eviction");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 32000000, 0, 32000000), 0,
+                  "younger pause and active flow preserved");
+    f[1]->downlink_last_ack_us = 34000000;
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 0, 32000000), 0,
+                  "ACK-progressing slow receiver preserved under pressure");
+    mqvpn_tcp_lane_free(lane);
+}
+
+static void
+test_pressure_reclaim_resamples_between_victims(void)
+{
+    relay_reset();
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0xdc0a, NULL, fake_clock, NULL);
+    struct tcp_pcb pcb[20];
+    int req[20], stream[20];
+    for (int i = 0; i < 20; i++) {
+        mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb[i], 8000 + i, &req[i], &stream[i], 1);
+        ASSERT_TRUE(f != NULL, "batch fixture");
+        f->downlink_paused = 1;
+        f->downlink_pause_since_us = 1000000 + i;
+    }
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 0, 32000000), 1,
+                  "one victim before resampling aggregate credit");
+    ASSERT_EQ_INT(lane->n_tcp_flows, 19, "remaining flows preserved");
+    ASSERT_EQ_INT(g_tcp_abort_calls, 1, "only one PCB aborted");
+    ASSERT_EQ_INT(g_h3_close_calls, 1, "only one H3 request cancelled");
+    ASSERT_EQ_INT(lane->stats.pressure_evicted, 1, "cancellation observable");
+    mqvpn_tcp_lane_free(lane);
+}
+
+static void
+test_pressure_zero_window_reclaims_before_exhaustion(void)
+{
+    relay_reset();
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0xdc0b, NULL, fake_clock, NULL);
+    struct tcp_pcb pcb[3];
+    int req[3], stream[3];
+    mqvpn_tcp_flow_t *f[3];
+    for (int i = 0; i < 3; i++) {
+        f[i] = setup_flow(lane, &pcb[i], 8040 + i, &req[i], &stream[i], 1);
+        ASSERT_TRUE(f[i] != NULL, "zero-window fixture");
+        f[i]->downlink_paused = 1;
+        f[i]->downlink_pause_since_us = 1000000;
+    }
+    pcb[2].snd_wnd = 65535;               /* positive window: 30 s loss grace */
+    f[1]->downlink_last_ack_us = 4000000; /* slow, but progressing */
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000, 8388608, 25165824), 0,
+                  "reserve still healthy");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000, 1048576, 25165823), 0,
+                  "not application-buffer pressure");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 5999999, 1048576, 25165824), 0,
+                  "short zero-window pause preserved");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000, 1048576, 25165824), 1,
+                  "reclaim while new requests still have credit");
+    ASSERT_TRUE(g_tcp_abort_last_pcb == &pcb[0], "only stalled zero-window receiver");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000, 1048576, 25165824), 0,
+                  "ACK progress and positive-window loss protected");
+    mqvpn_tcp_lane_free(lane);
+}
+
+static void
+test_downlink_queue_quota_resume_and_shrinking_stash(void)
+{
+    relay_reset();
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0xdc02, NULL, fake_clock, NULL);
+    struct tcp_pcb pcb;
+    int req, stream;
+    mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb, 7902, &req, &stream, 1);
+    ASSERT_TRUE(f != NULL, "quota flow established");
+    pcb.mss = 100;
+    pcb.snd_queuelen = 128;
+    h3_recv_push_data(mk_dl_bytes(300), 300, 1);
+    mqvpn_tcp_lane_downlink_pump(lane, &stream);
+    ASSERT_EQ_INT(g_h3_recv_calls, 0, "full quota must not consume H3");
+    ASSERT_EQ_INT(f->downlink_stash_len, 0, "quota pause needs no stash");
+    ASSERT_EQ_INT(f->downlink_paused, 1, "quota pause recorded");
+    pcb.snd_queuelen = 127;
+    mqvpn_tcp_lane_on_lwip_sent(f, &pcb, 100);
+    ASSERT_EQ_INT(g_tcp_write_capture_len, 300,
+                  "bounded partial reads preserve all bytes");
+    ASSERT_TRUE(memcmp(g_tcp_write_capture, g_expected, 300) == 0,
+                "byte exact, including FIN on final partial read");
+    ASSERT_EQ_INT(f->fin_received_from_h3, 1, "FIN survives partial reads");
+    mqvpn_tcp_lane_free(lane);
+
+    relay_reset();
+    lane = mqvpn_tcp_lane_new(&cfg, 0xdc03, NULL, fake_clock, NULL);
+    f = setup_flow(lane, &pcb, 7903, &req, &stream, 1);
+    pcb.mss = 100;
+    pcb.snd_queuelen = 127;
+    ASSERT_EQ_INT(tcp_lane_downlink_stash(f, mk_dl_bytes(300), 300), 0,
+                  "existing large stash");
+    tcp_lane_downlink_pause(f);
+    for (int i = 0; i < 3; ++i) {
+        ASSERT_EQ_INT(tcp_lane_downlink_stash_retry(f), TCP_LANE_FLOW_LIVE,
+                      "shrunken quota supports partial stash writes");
+        ASSERT_EQ_INT(f->downlink_stash_len, 200 - i * 100, "remaining stash");
+    }
+    ASSERT_EQ_INT(f->downlink_paused, 0, "stash eventually resumes");
+    ASSERT_EQ_INT(g_tcp_write_capture_len, 300, "stash all delivered");
+    ASSERT_TRUE(memcmp(g_tcp_write_capture, g_expected, 300) == 0,
+                "no loss or duplication on partial retries");
+    pcb.snd_queuelen = 0;
+    lane->n_tcp_flows = MEMP_NUM_TCP_SEG / 2;
+    ASSERT_EQ_INT(tcp_lane_downlink_queue_room(f), 100, "one segment at high admission");
+    lane->n_tcp_flows = 1;
+    mqvpn_tcp_lane_free(lane);
+}
+
+static void
 test_downlink_basic(void)
 {
     relay_reset();
@@ -3726,6 +3935,11 @@ main(void)
     test_relay_fatal_error_paths();
     test_relay_lane_free_with_queued_backlog();
     test_relay_fin_during_pending_stream();
+    test_stream_diagnostic_pause_and_resume();
+    test_pressure_reclaims_only_old_paused_receiver();
+    test_pressure_reclaim_resamples_between_victims();
+    test_pressure_zero_window_reclaims_before_exhaustion();
+    test_downlink_queue_quota_resume_and_shrinking_stash();
     test_downlink_basic();
     test_downlink_err_mem_stash_and_resume();
     test_downlink_sent_notify_still_resumes();
