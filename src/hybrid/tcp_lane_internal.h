@@ -180,6 +180,7 @@ typedef struct mqvpn_tcp_flow {
                                       * deferred until the low-water resume */
     int uplink_withheld;
     int downlink_paused;
+    uint64_t downlink_pause_since_us; /* diagnostic only */
     int fin_sent_to_h3;
     int fin_received_from_h3;
     int tcp_fin_seen;

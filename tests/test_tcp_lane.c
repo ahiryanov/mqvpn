@@ -2048,6 +2048,59 @@ test_relay_fin_during_pending_stream(void)
  * mk_pbuf — the "source" is a scripted H3 recv_body delivery, not a pbuf). */
 
 static void
+test_stream_diagnostic_pause_and_resume(void)
+{
+    relay_reset();
+    g_fake_now = 1000000;
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0xdc01, NULL, fake_clock, NULL);
+    struct tcp_pcb pcb;
+    int req, stream;
+    mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb, 7901, &req, &stream, 1);
+    ASSERT_TRUE(f != NULL, "diagnostic flow established");
+    mqvpn_tcp_lane_stats_t st;
+    mqvpn_tcp_lane_get_stats(lane, &st);
+    ASSERT_EQ_INT(st.established, 1, "established gauge");
+    ASSERT_EQ_INT(st.downlink_paused, 0, "no initial pause");
+
+    h3_recv_push_data(mk_dl_bytes(400), 400, 0);
+    tw_script_push(ERR_MEM);
+    mqvpn_tcp_lane_downlink_pump(lane, &stream);
+    g_fake_now += 2500000;
+    tw_script_push(ERR_MEM);
+    mqvpn_tcp_lane_downlink_pump(lane, &stream);
+    mqvpn_tcp_lane_get_stats(lane, &st);
+    ASSERT_EQ_INT(st.downlink_paused, 1, "paused gauge");
+    ASSERT_EQ_INT(st.downlink_stash_bytes, 400, "stash bytes");
+    ASSERT_EQ_INT(st.downlink_h3_bytes, 400, "H3 consumed once");
+    ASSERT_EQ_INT(st.downlink_tcp_bytes, 0, "failed writes not progress");
+    ASSERT_EQ_INT(st.downlink_err_mem, 2, "both ERR_MEM attempts counted");
+    ASSERT_EQ_INT(st.downlink_retry_calls, 1, "one retry");
+    ASSERT_EQ_INT(st.downlink_pause_events, 1, "retry is not a new pause");
+    ASSERT_EQ_INT(st.downlink_pause_max_ms, 2500, "retry never resets age");
+    mqvpn_tcp_lane_get_stats(lane, &st);
+    ASSERT_EQ_INT(st.downlink_paused, 1, "repeated snapshot not accumulated");
+
+    g_fake_now = 500000; /* clock regression cannot underflow age */
+    mqvpn_tcp_lane_get_stats(lane, &st);
+    ASSERT_EQ_INT(st.downlink_pause_max_ms, 0, "age clamps on clock regression");
+    g_fake_now = 4000000;
+    mqvpn_tcp_lane_downlink_pump(lane, &stream);
+    mqvpn_tcp_lane_on_lwip_sent(f, &pcb, 400);
+    mqvpn_tcp_lane_get_stats(lane, &st);
+    ASSERT_EQ_INT(st.downlink_paused, 0, "resumed gauge");
+    ASSERT_EQ_INT(st.downlink_pause_max_ms, 0, "pause age cleared");
+    ASSERT_EQ_INT(st.downlink_stash_bytes, 0, "stash drained");
+    ASSERT_EQ_INT(st.downlink_tcp_bytes, 400, "successful retry is progress");
+    ASSERT_EQ_INT(st.downlink_acked_bytes, 400, "only acknowledged bytes");
+    ASSERT_EQ_INT(st.downlink_resume_events, 1, "one resume");
+    ASSERT_EQ_INT(st.downlink_retry_calls, 2, "both retries counted");
+    f->pcb = NULL;
+    mqvpn_tcp_lane_free(lane);
+}
+
+static void
 test_downlink_basic(void)
 {
     relay_reset();
@@ -3726,6 +3779,7 @@ main(void)
     test_relay_fatal_error_paths();
     test_relay_lane_free_with_queued_backlog();
     test_relay_fin_during_pending_stream();
+    test_stream_diagnostic_pause_and_resume();
     test_downlink_basic();
     test_downlink_err_mem_stash_and_resume();
     test_downlink_sent_notify_still_resumes();

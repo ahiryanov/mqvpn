@@ -253,6 +253,8 @@ ctrl_cmd_get_stats(const char *req, char *resp, size_t resp_len, ctrl_socket_t *
         nc = mqvpn_server_get_n_clients(server);
         uptime = mqvpn_server_uptime_seconds(server);
     }
+    mqvpn_internal_stream_diag_t sd = {0};
+    if (cli_ctx) mqvpn_client_get_stream_diag(cli_ctx->client, &sd);
     uint64_t rx_receives = 0, rx_datagrams = 0;
     if (cs->rx_stats) cs->rx_stats(cs->rx_ctx, &rx_receives, &rx_datagrams);
     return snprintf(
@@ -274,12 +276,50 @@ ctrl_cmd_get_stats(const char *req, char *resp, size_t resp_len, ctrl_socket_t *
          * capability probe. */
         "\"udp_tx_sends\":%" PRIu64 ",\"udp_tx_datagrams\":%" PRIu64 ","
         "\"udp_rx_receives\":%" PRIu64 ",\"udp_rx_datagrams\":%" PRIu64 ","
-        "\"uptime_sec\":%" PRIu64 "}",
+        "\"uptime_sec\":%" PRIu64 ",\"stream_diag\":{\"available\":%d,"
+        "\"recv_limit\":%" PRIu64 ","
+        "\"recv_used\":%" PRIu64 ","
+        "\"recv_read\":%" PRIu64 ","
+        "\"h3_pending\":%" PRIu64 ","
+        "\"recv_credit\":%" PRIu64 ","
+        "\"recv_window\":%" PRIu64 ","
+        "\"recv_window_update_age_ms\":%" PRIu64 ","
+        "\"send_limit\":%" PRIu64 ","
+        "\"send_used\":%" PRIu64 ","
+        "\"send_credit\":%" PRIu64 ","
+        "\"send_blocked\":%" PRIu64 ","
+        "\"tcp_pending_accept\":%" PRIu64 ","
+        "\"tcp_pending_stream\":%" PRIu64 ","
+        "\"tcp_established\":%" PRIu64 ","
+        "\"tcp_closing\":%" PRIu64 ","
+        "\"tcp_downlink_paused\":%" PRIu64 ","
+        "\"tcp_uplink_withheld\":%" PRIu64 ","
+        "\"tcp_downlink_stash_bytes\":%" PRIu64 ","
+        "\"tcp_uplink_queued_bytes\":%" PRIu64 ","
+        "\"tcp_downlink_pause_max_ms\":%" PRIu64 ","
+        "\"tcp_downlink_h3_bytes\":%" PRIu64 ","
+        "\"tcp_downlink_tcp_bytes\":%" PRIu64 ","
+        "\"tcp_downlink_acked_bytes\":%" PRIu64 ","
+        "\"tcp_downlink_pause_events\":%" PRIu64 ","
+        "\"tcp_downlink_resume_events\":%" PRIu64 ","
+        "\"tcp_downlink_retry_calls\":%" PRIu64 ","
+        "\"tcp_downlink_sndbuf_blocks\":%" PRIu64 ","
+        "\"tcp_downlink_err_mem\":%" PRIu64 ","
+        "\"tcp_downlink_h3_again\":%" PRIu64 "}}",
         nc, st.bytes_tx, st.bytes_rx, st.dgram_sent, st.dgram_recv, st.dgram_lost,
         st.dgram_acked, st.pkts_lane_tcp, st.pkts_lane_dgram, st.pkts_lane_raw,
         st.pkts_lane_tcp_dropped, st.tcp_flows_active, st.tcp_flows_total,
         st.tcp_flows_rejected, st.raw_markers_active, st.udp_tx_sends,
-        st.udp_tx_datagrams, rx_receives, rx_datagrams, uptime);
+        st.udp_tx_datagrams, rx_receives, rx_datagrams, uptime, sd.available,
+        sd.recv_limit, sd.recv_used, sd.recv_read, sd.h3_pending, sd.recv_credit,
+        sd.recv_window, sd.recv_window_update_age_ms, sd.send_limit, sd.send_used,
+        sd.send_credit, sd.send_blocked, sd.tcp_pending_accept, sd.tcp_pending_stream,
+        sd.tcp_established, sd.tcp_closing, sd.tcp_downlink_paused,
+        sd.tcp_uplink_withheld, sd.tcp_downlink_stash_bytes, sd.tcp_uplink_queued_bytes,
+        sd.tcp_downlink_pause_max_ms, sd.tcp_downlink_h3_bytes, sd.tcp_downlink_tcp_bytes,
+        sd.tcp_downlink_acked_bytes, sd.tcp_downlink_pause_events,
+        sd.tcp_downlink_resume_events, sd.tcp_downlink_retry_calls,
+        sd.tcp_downlink_sndbuf_blocks, sd.tcp_downlink_err_mem, sd.tcp_downlink_h3_again);
 }
 
 static int

@@ -548,6 +548,29 @@ mqvpn_tcp_lane_get_stats(const mqvpn_tcp_lane_t *lane, mqvpn_tcp_lane_stats_t *o
      * and can never leave the stats snapshot out of sync. */
     out->flows_active = lane->n_tcp_flows;
     out->raw_markers_active = lane->n_raw_markers;
+    uint64_t now = lane->clock_fn ? lane->clock_fn(lane->clock_ctx) : 0;
+    /* No extra work in tick: walk only when the operator requests stats. */
+    for (uint32_t b = 0; b < lane->n_buckets; b++) {
+        for (const mqvpn_tcp_flow_t *f = lane->buckets[b]; f; f = f->next) {
+            switch (f->state) {
+            case TCP_FLOW_PENDING_ACCEPT: out->pending_accept++; break;
+            case TCP_FLOW_PENDING_STREAM: out->pending_stream++; break;
+            case TCP_FLOW_ACTIVE: out->established++; break;
+            case TCP_FLOW_CLOSING: out->closing++; continue;
+            default: continue; /* sticky RAW owns no relay queues */
+            }
+            out->downlink_stash_bytes += f->downlink_stash_len;
+            out->uplink_queued_bytes += f->uplink_queued_bytes;
+            out->uplink_withheld += !!f->uplink_withheld;
+            if (f->downlink_paused) {
+                out->downlink_paused++;
+                uint64_t age = now >= f->downlink_pause_since_us
+                                   ? (now - f->downlink_pause_since_us) / 1000
+                                   : 0;
+                if (age > out->downlink_pause_max_ms) out->downlink_pause_max_ms = age;
+            }
+        }
+    }
 }
 
 uint32_t
@@ -678,6 +701,7 @@ tcp_lane_downlink_drain(mqvpn_tcp_flow_t *f)
         int fin = 0;
         ssize_t n = cli_tcp_lane_h3_recv(f->h3_request, buf, sizeof(buf), &fin);
         if (n == MQVPN_TCP_LANE_H3_RECV_AGAIN) {
+            f->lane->stats.downlink_h3_again++;
             break;
         }
         if (n == MQVPN_TCP_LANE_H3_RECV_ERR) {
@@ -699,16 +723,22 @@ tcp_lane_downlink_drain(mqvpn_tcp_flow_t *f)
             return mqvpn_tcp_lane_on_relay_error(f);
         }
         if (n > 0) {
+            f->lane->stats.downlink_h3_bytes += (uint64_t)n;
             if ((size_t)MQVPN_TCP_LANE_TCP_SNDBUF(f->pcb) < (size_t)n) {
+                f->lane->stats.downlink_sndbuf_blocks++;
                 if (tcp_lane_downlink_stash(f, buf, (uint16_t)n) < 0) {
                     return mqvpn_tcp_lane_on_relay_error(f);
                 }
                 f->downlink_paused = 1;
+                f->downlink_pause_since_us =
+                    f->lane->clock_fn ? f->lane->clock_fn(f->lane->clock_ctx) : 0;
+                f->lane->stats.downlink_pause_events++;
                 break;
             }
             err_t werr =
                 MQVPN_TCP_LANE_TCP_WRITE(f->pcb, buf, (uint16_t)n, TCP_WRITE_FLAG_COPY);
             if (werr == ERR_MEM) {
+                f->lane->stats.downlink_err_mem++;
                 /* Transient — the write_checks gate (queuelen or a stricter
                  * internal check than the sndbuf test above) said not now.
                  * Same stash-and-pause handling as the sndbuf gate. */
@@ -716,11 +746,15 @@ tcp_lane_downlink_drain(mqvpn_tcp_flow_t *f)
                     return mqvpn_tcp_lane_on_relay_error(f);
                 }
                 f->downlink_paused = 1;
+                f->downlink_pause_since_us =
+                    f->lane->clock_fn ? f->lane->clock_fn(f->lane->clock_ctx) : 0;
+                f->lane->stats.downlink_pause_events++;
                 break;
             }
             if (werr != ERR_OK) {
                 return mqvpn_tcp_lane_on_relay_error(f);
             }
+            f->lane->stats.downlink_tcp_bytes += (uint64_t)n;
             wrote_any = 1;
         }
         if (fin) {
@@ -754,20 +788,26 @@ tcp_lane_downlink_drain(mqvpn_tcp_flow_t *f)
 static tcp_lane_flow_status_t
 tcp_lane_downlink_stash_retry(mqvpn_tcp_flow_t *f)
 {
+    f->lane->stats.downlink_retry_calls++;
     if ((size_t)MQVPN_TCP_LANE_TCP_SNDBUF(f->pcb) < (size_t)f->downlink_stash_len) {
+        f->lane->stats.downlink_sndbuf_blocks++;
         return TCP_LANE_FLOW_LIVE; /* still not enough room; wait and retry later */
     }
     err_t werr = MQVPN_TCP_LANE_TCP_WRITE(f->pcb, f->downlink_stash,
                                           f->downlink_stash_len, TCP_WRITE_FLAG_COPY);
     if (werr == ERR_MEM) {
+        f->lane->stats.downlink_err_mem++;
         return TCP_LANE_FLOW_LIVE; /* transient; retry later */
     }
     if (werr != ERR_OK) {
         return mqvpn_tcp_lane_on_relay_error(f);
     }
     MQVPN_TCP_LANE_TCP_OUTPUT(f->pcb);
+    f->lane->stats.downlink_tcp_bytes += f->downlink_stash_len;
+    f->lane->stats.downlink_resume_events++;
     f->downlink_stash_len = 0;
     f->downlink_paused = 0;
+    f->downlink_pause_since_us = 0;
     return TCP_LANE_FLOW_LIVE;
 }
 
@@ -857,11 +897,11 @@ mqvpn_tcp_lane_downlink_pump(mqvpn_tcp_lane_t *lane, void *stream)
 static err_t
 mqvpn_tcp_lane_on_lwip_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
 {
-    (void)len;
     mqvpn_tcp_flow_t *f = (mqvpn_tcp_flow_t *)arg;
     if (!f) {
         return ERR_OK;
     }
+    if (f->lane) f->lane->stats.downlink_acked_bytes += len;
     (void)pcb; /* f->pcb is the same pointer; kept for signature parity */
 
     /* Activity signal, same rationale as on_lwip_recv's stamp. */

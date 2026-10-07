@@ -150,6 +150,25 @@ typedef struct {
                                   * currently in the table — surfaced through
                                   * mqvpn_client_get_stats as the public
                                   * raw_markers_active stat */
+    /* On-demand gauges and per-lane cumulative relay counters. */
+    uint64_t pending_accept;
+    uint64_t pending_stream;
+    uint64_t established;
+    uint64_t closing;
+    uint64_t downlink_paused;
+    uint64_t uplink_withheld;
+    uint64_t downlink_stash_bytes;
+    uint64_t uplink_queued_bytes;
+    uint64_t downlink_pause_max_ms;
+    uint64_t downlink_h3_bytes;
+    uint64_t downlink_tcp_bytes;
+    uint64_t downlink_acked_bytes;
+    uint64_t downlink_pause_events;
+    uint64_t downlink_resume_events;
+    uint64_t downlink_retry_calls;
+    uint64_t downlink_sndbuf_blocks;
+    uint64_t downlink_err_mem;
+    uint64_t downlink_h3_again;
 } mqvpn_tcp_lane_stats_t;
 
 /* client_ctx is opaque to tcp_lane.c's callers outside mqvpn_client.c; it is

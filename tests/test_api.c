@@ -1299,6 +1299,20 @@ TEST(client_get_state_null)
     ASSERT_EQ(mqvpn_client_get_state(NULL), MQVPN_STATE_CLOSED);
 }
 
+TEST(client_stream_diag_unavailable)
+{
+    mqvpn_client_t *c = make_test_client();
+    mqvpn_internal_stream_diag_t diag;
+    memset(&diag, 0xff, sizeof(diag));
+    ASSERT_EQ(mqvpn_client_get_stream_diag(c, &diag), MQVPN_OK);
+    ASSERT_EQ(diag.available, 0);
+    ASSERT_EQ(diag.h3_pending, 0);
+    ASSERT_EQ(diag.tcp_downlink_paused, 0);
+    ASSERT_EQ(mqvpn_client_get_stream_diag(NULL, &diag), MQVPN_ERR_INVALID_ARG);
+    ASSERT_EQ(mqvpn_client_get_stream_diag(c, NULL), MQVPN_ERR_INVALID_ARG);
+    mqvpn_client_destroy(c);
+}
+
 TEST(client_get_stats)
 {
     mqvpn_client_t *c = make_test_client();
@@ -4691,6 +4705,7 @@ main(void)
 
     /* Query tests */
     run_client_get_state_null();
+    run_client_stream_diag_unavailable();
     run_client_get_stats();
     run_client_get_reorder_stats_null_args();
     run_client_get_reorder_stats_zero_fill_when_unconnected();

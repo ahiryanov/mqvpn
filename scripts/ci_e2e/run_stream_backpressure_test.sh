@@ -114,7 +114,7 @@ ip netns exec "$NS_S" "$MQVPN" --config "$WORK/server.conf" >"$WORK/server.log" 
 SERVER_PID=$!
 wait_tun "$NS_S" "$SERVER_PID"
 ip -n "$NS_S" route add 10.111.252.0/22 dev mqvpn0
-ip netns exec "$NS_C" "$MQVPN" --config "$WORK/client.conf" >"$WORK/client.log" 2>&1 &
+ip netns exec "$NS_C" "$MQVPN" --config "$WORK/client.conf" --control-port 9091 >"$WORK/client.log" 2>&1 &
 CLIENT_PID=$!
 wait_tun "$NS_C" "$CLIENT_PID"
 ip -n "$NS_C" route add 192.168.100.0/24 dev mqvpn0
@@ -152,7 +152,7 @@ for ((i=0; i<50; i++)); do
 done
 [[ -f $WORK/peer.ready ]]
 ip netns exec "$NS_L" python3 - "$WORK" "$CLIENT_PID" "$NS_C" <<'PY'
-import socket, sys, pathlib, time, subprocess
+import socket, sys, pathlib, time, subprocess, json
 work, pid, router = pathlib.Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 def rss():
     text = pathlib.Path('/proc/%d/status' % pid).read_text()
@@ -160,6 +160,24 @@ def rss():
 def transport_rx():
     return int(subprocess.check_output(['ip', 'netns', 'exec', router, 'cat',
         '/sys/class/net/transport/statistics/rx_bytes']))
+def diag():
+    code = r"""import socket,json
+s=socket.create_connection(('127.0.0.1',9091),timeout=3)
+s.sendall(b'{"cmd":"get_stats"}\n')
+data=b''
+while True:
+    x=s.recv(8192)
+    if not x: break
+    data+=x
+print(data.decode())
+"""
+    st = json.loads(subprocess.check_output(
+        ['ip', 'netns', 'exec', router, 'python3', '-c', code]))
+    d = st['stream_diag']; assert d['available'] == 1
+    assert d['recv_credit'] == max(0, d['recv_limit'] - d['recv_used'])
+    assert d['send_credit'] == max(0, d['send_limit'] - d['send_used'])
+    return d
+
 def quick_probe():
     with socket.create_connection(('192.168.100.50', 443), timeout=5) as q:
         q.sendall(b'Q'); assert q.recv(1) == b'Q'
@@ -183,6 +201,11 @@ for _ in range(40):
     samples.append((transport_rx() - base_rx, rss()))
     time.sleep(.1)
 quick_probe()
+d = diag()
+assert d['h3_pending'] > 1024**2, ('unread H3 not visible', d)
+assert d['tcp_downlink_paused'] >= 1, ('paused TCP not visible', d)
+assert d['tcp_downlink_stash_bytes'] > 0, ('stash not visible', d)
+assert d['tcp_downlink_pause_max_ms'] > 0, ('pause age not visible', d)
 peak_rx = max(v[0] for v in samples); peak_rss = max(v[1] for v in samples)
 tail_rx = samples[-1][0] - samples[-10][0]
 print('paused: transport_rx=%d peak_rss=%d last_second_rx=%d' %
@@ -193,6 +216,10 @@ assert peak_rss < 160 * 1024**2, ('unbounded client RSS', peak_rss)
 receive_exact(c, 64 * 1024**2 - 65536)
 assert c.recv(1) == b''; c.close()
 quick_probe()
+d = diag()
+assert d['h3_pending'] == 0 and d['tcp_downlink_paused'] == 0, d
+assert d['tcp_downlink_h3_bytes'] >= 64 * 1024**2, d
+assert d['tcp_downlink_tcp_bytes'] >= 64 * 1024**2, d
 print('PASS: 64 MiB byte-exact download resumes; another flow works while paused')
 # Several stalled flows exercise the aggregate credit. Abort them and check
 # that the same VPN connection accepts another byte-exact transfer.
@@ -213,5 +240,8 @@ time.sleep(.5)
 quick_probe()
 with socket.create_connection(('192.168.100.50', 443), timeout=40) as q:
     q.sendall(b'D'); receive_exact(q, 64 * 1024**2); assert q.recv(1) == b''
+d = diag()
+assert d['h3_pending'] == 0 and d['tcp_downlink_paused'] == 0, d
+assert d['tcp_downlink_resume_events'] > 0, d
 print('PASS: aggregate bounded; cancelled downloads release credit without reconnect')
 PY

@@ -241,7 +241,7 @@ datagram counters and uptime.
 | `uptime_sec` | uint64  | Seconds since `mqvpn_server_create` was called (server) / `mqvpn_client_new` was called (client) — process uptime, not "seconds connected". |
 
 Notes:
-- **All fields in this command are now wired for both modes** (fixed after
+- **All top-level traffic fields in this command are wired for both modes** (fixed after
   being silently server-only for several releases — see §7). Previously,
   every field except `udp_rx_receives`/`udp_rx_datagrams` (sourced from the
   platform layer, not `mqvpn_stats_t`) read `0` in client mode regardless of
@@ -262,6 +262,48 @@ Notes:
   config keys that control this behavior.
 
 ---
+
+### STREAM diagnostic snapshot in `get_stats`
+
+`stream_diag` is an additive object. Existing top-level fields and commands
+are unchanged. It is read-only, has no configuration switch and emits no
+per-flow log messages. Poll it every 10 seconds for stall investigation.
+`available` is `1` only for an established client connection; it is `0`
+(with zero values) before connection and in server mode. The remote server
+does not need this diagnostic build. Rebuild the client and its pinned
+xquic together: xquic's connection-stats struct has grown; do not mix the
+old shared library with the new executable/library.
+
+All values below are unsigned integers. Byte measurements are payload or
+QUIC offsets, not total heap/RSS usage. The connection includes H3 control
+streams as well as hybrid TCP streams.
+
+| Field in `stream_diag` | Meaning |
+|---|---|
+| `recv_limit`, `recv_used`, `recv_read` | Cumulative advertised receive MAX_DATA, used receive offsets and transport-delivered bytes. Used offsets include gaps/final sizes; this is not a wire byte count. |
+| `h3_pending` | H3 DATA retained until the application reads or cancels it, summed across the connection. |
+| `recv_credit` | `max(0, recv_limit - recv_used)`: remaining credit available to the peer. This is **not** the receive window minus application-consumed bytes. |
+| `recv_window` | Current target connection receive window. |
+| `recv_window_update_age_ms` | Time since the last receive-window update, using the injected connection clock. Zero if none has occurred. |
+| `send_limit`, `send_used`, `send_credit` | Peer-advertised MAX_DATA, used send offsets and their clamped difference. |
+| `send_blocked` | Local connection DATA_BLOCKED flag, 0 or 1; distinct from lack of congestion-window space. |
+| `tcp_pending_accept`, `tcp_pending_stream`, `tcp_established`, `tcp_closing` | Current flow-table state counts. Closing routing markers are excluded from `tcp_flows_active`. Sticky RAW markers are excluded from all relay gauges. |
+| `tcp_downlink_paused`, `tcp_uplink_withheld` | Current flows paused on TCP output, and flows withholding TCP receive credit on upload. |
+| `tcp_downlink_stash_bytes`, `tcp_uplink_queued_bytes` | Bytes already read from H3 awaiting TCP write, and upload bytes not yet accepted by H3. The stash is separate from `h3_pending`. |
+| `tcp_downlink_pause_max_ms` | Longest currently uninterrupted output pause. A failed retry does not reset it; a successful retry clears it. This is not an idle timeout or a confirmed dead-flow count. |
+| `tcp_downlink_h3_bytes`, `tcp_downlink_tcp_bytes`, `tcp_downlink_acked_bytes` | Cumulative DATA consumed from H3, successfully queued to TCP, and acknowledged by LAN receivers. Failed writes/retries do not count as progress. |
+| `tcp_downlink_pause_events`, `tcp_downlink_resume_events` | Cumulative transitions into/out of an output pause. Flow cancellation is not a resume. |
+| `tcp_downlink_retry_calls`, `tcp_downlink_sndbuf_blocks`, `tcp_downlink_err_mem` | Cumulative stash retry calls, insufficient-send-buffer gates and TCP write ERR_MEM returns; retries can contribute repeatedly. |
+| `tcp_downlink_h3_again` | Cumulative H3 reads with no data available; normally nonzero, not itself an error. |
+
+Gauges are recomputed when queried; relay counters last for the TCP lane's
+lifetime and reset on reconnect. QUIC offsets/window values belong to the
+current connection. Compare snapshots from the same connection/process.
+A growing `h3_pending` with near-zero `recv_credit` supports connection
+credit starvation. Growing pause age/stash with no increase in TCP/ACK
+bytes and **available** receive credit instead points toward the relay or
+LAN recipient. These are diagnostic clues, not automatic restart rules.
+The snapshot alone does not establish the underlying defect.
 
 ### 5.5 `get_status`
 
