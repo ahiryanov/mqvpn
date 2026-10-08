@@ -89,8 +89,9 @@ numbers are in
 
 Unread HTTP/3 bodies now retain the peer's receive credit. If an inner TCP
 receiver stops reading, the sender eventually stops sending over the VPN;
-reading again resumes the same transfer. The receive window is 16 MiB per
-stream and at most 32 MiB across one QUIC connection, plus a small parser
+reading again resumes the same transfer. Each stream starts with 256 KiB
+of receive credit and can grow to 16 MiB. The aggregate receive window is
+at most 256 MiB per QUIC connection and direction, plus a small parser
 allowance. These bound receive credit, not total process memory: lwIP, kernel
 sockets, packets, metadata and other connections also use memory. Several
 stalled streams can fill the shared window and temporarily delay other H3

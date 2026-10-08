@@ -2126,26 +2126,34 @@ test_pressure_reclaims_only_old_paused_receiver(void)
     f[0]->downlink_paused = f[1]->downlink_paused = 1;
     f[0]->downlink_pause_since_us = 1000000;
     f[1]->downlink_pause_since_us = 5000000;
-    ASSERT_EQ_INT(
-        mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 8 * 1024 * 1024, 32000000), 0,
-        "healthy credit preserves paused flows");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 40000000,
+                                                  MQVPN_H3_CONN_RECV_WINDOW / 4,
+                                                  MQVPN_H3_CONN_RECV_WINDOW),
+                  0, "healthy credit preserves paused flows");
     ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 0, 1000), 0,
                   "transport-only pressure does not reset LAN receivers");
-    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 30000000, 0, 32000000), 0,
-                  "transient pause preserved");
-    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 31000000, 0, 32000000), 1,
-                  "oldest continuously paused receiver removed");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 0,
+                                                  MQVPN_H3_CONN_RECV_WINDOW / 2 - 1),
+                  0, "less than half the larger budget does not evict");
+    ASSERT_EQ_INT(
+        mqvpn_tcp_lane_relieve_pressure(lane, 30000000, 0, MQVPN_H3_CONN_RECV_WINDOW), 0,
+        "transient pause preserved");
+    ASSERT_EQ_INT(
+        mqvpn_tcp_lane_relieve_pressure(lane, 31000000, 0, MQVPN_H3_CONN_RECV_WINDOW), 1,
+        "oldest continuously paused receiver removed");
     ASSERT_TRUE(g_tcp_abort_last_pcb == &pcb[0], "right PCB aborted");
     ASSERT_TRUE(g_h3_close_last_req == &req[0], "right H3 request cancelled");
     ASSERT_EQ_INT(g_tcp_abort_calls, 1, "one abort, not whole tunnel");
     ASSERT_EQ_INT(g_h3_close_calls, 1, "one H3 close");
     ASSERT_EQ_INT(lane->n_tcp_flows, 2, "other flows retained");
     ASSERT_EQ_INT(lane->stats.pressure_evicted, 1, "observable pressure eviction");
-    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 32000000, 0, 32000000), 0,
-                  "younger pause and active flow preserved");
+    ASSERT_EQ_INT(
+        mqvpn_tcp_lane_relieve_pressure(lane, 32000000, 0, MQVPN_H3_CONN_RECV_WINDOW), 0,
+        "younger pause and active flow preserved");
     f[1]->downlink_last_ack_us = 34000000;
-    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 0, 32000000), 0,
-                  "ACK-progressing slow receiver preserved under pressure");
+    ASSERT_EQ_INT(
+        mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 0, MQVPN_H3_CONN_RECV_WINDOW), 0,
+        "ACK-progressing slow receiver preserved under pressure");
     mqvpn_tcp_lane_free(lane);
 }
 
@@ -2164,8 +2172,9 @@ test_pressure_reclaim_resamples_between_victims(void)
         f->downlink_paused = 1;
         f->downlink_pause_since_us = 1000000 + i;
     }
-    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 0, 32000000), 1,
-                  "one victim before resampling aggregate credit");
+    ASSERT_EQ_INT(
+        mqvpn_tcp_lane_relieve_pressure(lane, 40000000, 0, MQVPN_H3_CONN_RECV_WINDOW), 1,
+        "one victim before resampling aggregate credit");
     ASSERT_EQ_INT(lane->n_tcp_flows, 19, "remaining flows preserved");
     ASSERT_EQ_INT(g_tcp_abort_calls, 1, "only one PCB aborted");
     ASSERT_EQ_INT(g_h3_close_calls, 1, "only one H3 request cancelled");
@@ -2191,17 +2200,23 @@ test_pressure_zero_window_reclaims_before_exhaustion(void)
     }
     pcb[2].snd_wnd = 65535;               /* positive window: 30 s loss grace */
     f[1]->downlink_last_ack_us = 4000000; /* slow, but progressing */
-    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000, 8388608, 25165824), 0,
-                  "reserve still healthy");
-    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000, 1048576, 25165823), 0,
-                  "not application-buffer pressure");
-    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 5999999, 1048576, 25165824), 0,
-                  "short zero-window pause preserved");
-    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000, 1048576, 25165824), 1,
-                  "reclaim while new requests still have credit");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000,
+                                                  MQVPN_H3_CONN_RECV_WINDOW / 4,
+                                                  3ULL * MQVPN_H3_CONN_RECV_WINDOW / 4),
+                  0, "reserve still healthy");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(
+                      lane, 6000000, 1048576, 3ULL * MQVPN_H3_CONN_RECV_WINDOW / 4 - 1),
+                  0, "not application-buffer pressure");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 5999999, 1048576,
+                                                  3ULL * MQVPN_H3_CONN_RECV_WINDOW / 4),
+                  0, "short zero-window pause preserved");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000, 1048576,
+                                                  3ULL * MQVPN_H3_CONN_RECV_WINDOW / 4),
+                  1, "reclaim while new requests still have credit");
     ASSERT_TRUE(g_tcp_abort_last_pcb == &pcb[0], "only stalled zero-window receiver");
-    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000, 1048576, 25165824), 0,
-                  "ACK progress and positive-window loss protected");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_relieve_pressure(lane, 6000000, 1048576,
+                                                  3ULL * MQVPN_H3_CONN_RECV_WINDOW / 4),
+                  0, "ACK progress and positive-window loss protected");
     mqvpn_tcp_lane_free(lane);
 }
 

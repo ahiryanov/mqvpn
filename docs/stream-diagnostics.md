@@ -7,18 +7,18 @@ then stalled even below TcpMaxFlows and with bounded process memory.
 This fix limits each LAN TCP queue to its share of half the segment pool
 (maximum 128 queued pbufs when few flows are active). DATA stays in H3 until
 the queue can accept it; partial stash retries preserve bytes and FIN.
-The aggregate QUIC receive window stays bounded at 32 MiB. Each stream
-starts at 64 KiB and can grow to the original 16 MiB ceiling when half its current window is
+The aggregate QUIC receive window is bounded at 256 MiB per tunnel and
+direction. Each stream starts at 256 KiB and can grow to the original 16 MiB ceiling when half its current window is
 consumed within two RTTs and unread DATA is low. The sampler is independent
 of frequent credit refills, so a fast reader is not fixed at 256 KiB.
-Growth stops while aggregate unread DATA occupies at least 24 MiB.
+Growth stops while aggregate unread DATA occupies at least 192 MiB.
 Unread bodies and repeated BLOCKED frames cannot trigger adaptive growth.
 xquic reissues sub-half-window consumed credit when the peer is short of
 credit, without crediting unread DATA. TCP scheduling and flow caps are unchanged.
 
-The client reclaims headroom before complete exhaustion: less than 8 MiB
-credit together with at least 24 MiB unread H3 DATA. The original exhaustion
-fallback (less than 16 KiB credit with at least 16 MiB unread H3 DATA) also
+The client reclaims headroom before complete exhaustion: less than 64 MiB
+credit together with at least 192 MiB unread H3 DATA. The exhaustion
+fallback (less than 16 KiB credit with at least 128 MiB unread H3 DATA) also
 remains, covering receive credit held in transport reassembly. An explicitly zero-window
 LAN receiver must be continuously paused and without positive downlink ACK
 progress for 5 seconds; a positive TCP window retains the 30-second grace
@@ -30,8 +30,12 @@ autotuned flow has already freed enough credit. Cancellation resets that
 TCP connection and its H3 request, never the VPN; the application must retry.
 This remains a pressure fallback, not a guarantee for unlimited stalled peers.
 
-Build mqvpn from `fix/upstream-stream-backpressure-20261006` with the exact
-xquic gitlink pinned by the commit (`fix/stream-credit-progress-20261007`).
+The 256 KiB / 16 MiB / 256 MiB profile is on
+`perf/stream-window-256m-20261008`, based on the accepted STREAM fix without
+the experimental BBR2 probe-wait change. Use the exact xquic gitlink pinned
+by the mqvpn commit. The larger receive budget is not preallocated and is
+not a process RSS limit; retained payload can be 224 MiB higher per tunnel
+and direction than the earlier 32 MiB profile, plus metadata and other queues.
 Rebuild both client and server, including their matching xquic headers and
 libraries. The xquic connection-settings/stats ABI grew; mixing new mqvpn
 with an old xquic shared library is unsafe. The public libmqvpn stats ABI and

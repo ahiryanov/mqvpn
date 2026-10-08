@@ -64,15 +64,15 @@ test_asymmetry_server_vs_client(void)
     mqvpn_build_conn_settings(&c_off, &cli_mp_off);
 
     /* Both sides must advertise bounded initial H3 credit. */
-    ASSERT_EQ(srv.h3_body_recv_window, 16 * 1024 * 1024);
-    ASSERT_EQ(cli_mp_on.h3_body_recv_window, 16 * 1024 * 1024);
-    ASSERT_EQ(cli_mp_off.h3_body_recv_window, 16 * 1024 * 1024);
+    ASSERT_EQ(srv.h3_body_recv_window, 128 * 1024 * 1024);
+    ASSERT_EQ(cli_mp_on.h3_body_recv_window, 128 * 1024 * 1024);
+    ASSERT_EQ(cli_mp_off.h3_body_recv_window, 128 * 1024 * 1024);
     ASSERT_EQ(srv.h3_body_stream_recv_window, 16 * 1024 * 1024);
-    ASSERT_EQ(srv.h3_body_stream_initial_window, 64 * 1024);
+    ASSERT_EQ(srv.h3_body_stream_initial_window, 256 * 1024);
     ASSERT_EQ(cli_mp_on.h3_body_stream_recv_window, 16 * 1024 * 1024);
-    ASSERT_EQ(cli_mp_on.h3_body_stream_initial_window, 64 * 1024);
+    ASSERT_EQ(cli_mp_on.h3_body_stream_initial_window, 256 * 1024);
     ASSERT_EQ(cli_mp_off.h3_body_stream_recv_window, 16 * 1024 * 1024);
-    ASSERT_EQ(cli_mp_off.h3_body_stream_initial_window, 64 * 1024);
+    ASSERT_EQ(cli_mp_off.h3_body_stream_initial_window, 256 * 1024);
 
     /* Server side: MP always on, grant capped at 64, ping_on absent. */
     ASSERT_EQ(srv.enable_multipath, 1);
