@@ -16,6 +16,7 @@
  */
 
 #include "hybrid/tcp_lane_internal.h"
+#include "mqvpn_stream_limits.h"
 
 #include <assert.h> /* pins the h3_recv "0 bytes implies fin" contract */
 #include <stdlib.h>
@@ -578,11 +579,12 @@ static int
 tcp_lane_relieve_one(mqvpn_tcp_lane_t *lane, uint64_t now_us, uint64_t credit,
                      uint64_t pending)
 {
-    /* Reclaim headroom before the 32 MiB connection window is exhausted.
+    /* Reclaim the final quarter of the configured connection budget.
      * A zero advertised TCP window identifies application backpressure;
      * ordinary loss with a positive window retains the longer grace. */
-    int reserve_low = credit < 8 * 1024 * 1024 && pending >= 24 * 1024 * 1024;
-    int exhausted = credit < 16384 && pending >= 16 * 1024 * 1024;
+    int reserve_low = credit < MQVPN_H3_CONN_RECV_WINDOW / 4 &&
+                      pending >= 3ULL * MQVPN_H3_CONN_RECV_WINDOW / 4;
+    int exhausted = credit < 16384 && pending >= MQVPN_H3_CONN_RECV_WINDOW / 2;
     if (!lane || (!reserve_low && !exhausted)) return 0;
     mqvpn_tcp_flow_t *oldest = NULL;
     for (uint32_t b = 0; b < lane->n_buckets; b++) {
