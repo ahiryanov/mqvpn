@@ -1231,6 +1231,8 @@ cb_xqc_log_write(xqc_log_level_t lvl, const void *buf, size_t size, void *user_d
     memcpy(msg, prefix, sizeof(prefix) - 1);
     mqvpn_xquic_annotate_err_codes((const char *)buf, size, msg + sizeof(prefix) - 1,
                                     sizeof(msg) - (sizeof(prefix) - 1));
+    if (mqvpn_xquic_log_is_routine(lvl, msg)) ml = MQVPN_LOG_DEBUG;
+    if (ml < c->log_level) return;
     c->cbs.log(ml, msg, c->user_ctx);
 }
 

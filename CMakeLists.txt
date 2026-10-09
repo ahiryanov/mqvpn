@@ -1296,6 +1296,11 @@ if(BUILD_TESTING)
     set_target_properties(test_xquic_abi_pin PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
     add_test(NAME test_xquic_abi_pin COMMAND test_xquic_abi_pin)
 
+    add_executable(test_xquic_log_filter tests/test_xquic_log_filter.c)
+    target_include_directories(test_xquic_log_filter PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR})
+    set_target_properties(test_xquic_log_filter PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_test(NAME test_xquic_log_filter COMMAND test_xquic_log_filter)
+
     add_executable(test_conn_settings tests/test_conn_settings.c)
     target_link_libraries(test_conn_settings mqvpn_lib ${XQUIC_LIB} ${SSL_LIB} ${CRYPTO_LIB} dl m stdc++)
     target_include_directories(test_conn_settings PRIVATE ${CMAKE_SOURCE_DIR}/src ${XQUIC_INCLUDE_DIR})
