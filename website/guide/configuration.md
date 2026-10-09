@@ -163,9 +163,11 @@ host uses the raw CONNECT-IP datagram lane. For LAN-initiated Hybrid TCP toward
 an RFC1918 central network, add the central CIDR to the server's repeated
 `[Hybrid] EgressAllow` list; private egress targets remain denied by default.
 
-Hybrid TCP stream mode creates a new TCP connection from the server, so the
-destination sees the server's source address. Set `[Hybrid] Tcp = raw` on the
-client (or disable Hybrid) when LAN source addresses must be preserved.
+By default Hybrid TCP stream mode creates a connection using the server's
+source address. To preserve the original IPv4 source address and port, enable
+`[Hybrid] Transparent = true` on both endpoints and configure the server's
+transparent socket return routing as described in the README. IPv6 uses the
+raw lane when transparent mode is enabled.
 Both endpoints must run this routed-network implementation; older clients
 do not process the additional source prefixes.
 
@@ -371,6 +373,7 @@ Terminates inner TCP locally and relays it over an HTTP/3 request stream so a si
 | Key | Description | Applies to | Default |
 |-----|-------------|------------|---------|
 | `Enabled` | Master switch | client + server | `false` |
+| `Transparent` | Preserve original IPv4 source address and port for STREAM TCP. Requires both peers, Linux transparent socket permissions and selective return routing on the server; IPv6 uses the raw lane | client + server | `false` |
 | `Tcp` | Per-flow TCP lane policy: `stream` (always), `raw` (never — byte-identical to hybrid disabled), or `auto` (TCP lane once ≥2 paths are active at SYN time; latched for the flow's lifetime) | client | `auto` |
 | `TcpMaxFlows` | Concurrent TCP-lane flow cap. **The client and the server enforce it on different machinery and fail differently** — see **Notes on `TcpMaxFlows`** right below this table | client + server | `256` |
 | `TcpIdleTimeoutSec` | Idle-eviction timeout for TCP-lane flows; `0` disables idle eviction | client + server | `300` |
