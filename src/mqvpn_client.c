@@ -121,6 +121,7 @@ xqc_find_path_metrics(const xqc_conn_stats_t *stats, uint64_t path_id)
 /* Per-connection state (Level 2 — destroyed on reconnect) */
 struct cli_conn_s {
     mqvpn_client_t *client;
+    uint64_t pressure_check_us;
     xqc_h3_conn_t *h3_conn;
     xqc_cid_t cid;
     size_t dgram_mss;
@@ -5257,8 +5258,26 @@ mqvpn_client_tick(mqvpn_client_t *c)
     /* H2/Task 13: TCP-lane idle-timeout eviction sweep. Order relative to
      * mqvpn_lwip_tick above is irrelevant (both run every tick; neither
      * depends on the other having just run). */
-    if (c->conn && c->conn->tcp_lane)
-        mqvpn_tcp_lane_tick(c->conn->tcp_lane, client_now_us(c));
+    if (c->conn && c->conn->tcp_lane) {
+        uint64_t now = client_now_us(c);
+        mqvpn_tcp_lane_tick(c->conn->tcp_lane, now);
+        if (now - c->conn->pressure_check_us >= 125000ULL) {
+            c->conn->pressure_check_us = now;
+            xqc_conn_stats_t xs = xqc_conn_get_stats(c->engine, &c->conn->cid);
+            uint64_t credit = xs.stream_diag_recv_limit > xs.stream_diag_recv_used
+                                  ? xs.stream_diag_recv_limit - xs.stream_diag_recv_used
+                                  : 0;
+            uint64_t pending = xs.stream_diag_h3_pending;
+            free(xs.paths_info);
+            int reclaimed =
+                mqvpn_tcp_lane_relieve_pressure(c->conn->tcp_lane, now, credit, pending);
+            if (reclaimed)
+                LOG_W(c,
+                      "TCP STREAM pressure: closed %d stalled receiver; "
+                      "receive-credit reserve low",
+                      reclaimed);
+        }
+    }
 #endif
 
     return MQVPN_OK;
@@ -5315,6 +5334,65 @@ mqvpn_client_get_stats(const mqvpn_client_t *c, mqvpn_stats_t *out)
         out->srtt_ms = (int)(xs.srtt / 1000);
         free(xs.paths_info);
     }
+    return MQVPN_OK;
+}
+
+int
+mqvpn_client_get_stream_diag(const mqvpn_client_t *c, mqvpn_internal_stream_diag_t *out)
+{
+    if (!c || !out) return MQVPN_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    if (!c->engine || !c->conn || c->state != MQVPN_STATE_ESTABLISHED) return MQVPN_OK;
+    out->available = 1;
+    xqc_conn_stats_t xs = xqc_conn_get_stats(c->engine, &c->conn->cid);
+    out->recv_limit = xs.stream_diag_recv_limit;
+    out->recv_used = xs.stream_diag_recv_used;
+    out->recv_read = xs.stream_diag_recv_read;
+    out->h3_pending = xs.stream_diag_h3_pending;
+    out->recv_window = xs.stream_diag_recv_window;
+    out->send_limit = xs.stream_diag_send_limit;
+    out->send_used = xs.stream_diag_send_used;
+    out->send_blocked = xs.stream_diag_send_blocked;
+    /* RFC 9000 section 4.1: credit is advertised MAX_DATA minus used
+     * offsets, not MAX_DATA minus application-consumed bytes. Clamp on
+     * invalid/transitional snapshots rather than wrapping UINT64_MAX. */
+    out->recv_credit =
+        out->recv_limit > out->recv_used ? out->recv_limit - out->recv_used : 0;
+    out->send_credit =
+        out->send_limit > out->send_used ? out->send_limit - out->send_used : 0;
+    uint64_t now = client_now_us(c);
+    if (xs.stream_diag_recv_window_update_us &&
+        now >= xs.stream_diag_recv_window_update_us)
+        out->recv_window_update_age_ms =
+            (now - xs.stream_diag_recv_window_update_us) / 1000;
+    free(xs.paths_info);
+#ifdef MQVPN_HYBRID_TCP_LANE_ENABLED
+    if (c->conn->tcp_lane) {
+        mqvpn_tcp_lane_stats_t st;
+        mqvpn_tcp_lane_get_stats(c->conn->tcp_lane, &st);
+        out->tcp_pending_accept = st.pending_accept;
+        out->tcp_pending_stream = st.pending_stream;
+        out->tcp_established = st.established;
+        out->tcp_closing = st.closing;
+        out->tcp_downlink_paused = st.downlink_paused;
+        out->tcp_uplink_withheld = st.uplink_withheld;
+        out->tcp_downlink_stash_bytes = st.downlink_stash_bytes;
+        out->tcp_uplink_queued_bytes = st.uplink_queued_bytes;
+        out->tcp_downlink_pause_max_ms = st.downlink_pause_max_ms;
+        out->tcp_downlink_h3_bytes = st.downlink_h3_bytes;
+        out->tcp_downlink_tcp_bytes = st.downlink_tcp_bytes;
+        out->tcp_downlink_acked_bytes = st.downlink_acked_bytes;
+        out->tcp_downlink_pause_events = st.downlink_pause_events;
+        out->tcp_downlink_resume_events = st.downlink_resume_events;
+        out->tcp_downlink_retry_calls = st.downlink_retry_calls;
+        out->tcp_downlink_sndbuf_blocks = st.downlink_sndbuf_blocks;
+        out->tcp_downlink_err_mem = st.downlink_err_mem;
+        out->tcp_downlink_h3_again = st.downlink_h3_again;
+        out->tcp_downlink_queue_blocks = st.downlink_queue_blocks;
+        out->tcp_downlink_queued_pbufs = st.downlink_queued_pbufs;
+        out->tcp_pressure_evicted = st.pressure_evicted;
+    }
+#endif
     return MQVPN_OK;
 }
 
