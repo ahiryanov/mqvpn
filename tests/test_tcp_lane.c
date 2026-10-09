@@ -2109,6 +2109,72 @@ test_stream_diagnostic_pause_and_resume(void)
 }
 
 static void
+test_stopped_receiver_deadline_without_pressure(void)
+{
+    relay_reset();
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    cfg.tcp_idle_timeout_sec = 0;
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0xdc10, NULL, fake_clock, NULL);
+    struct tcp_pcb pcb[4];
+    int req[4], stream[4];
+    mqvpn_tcp_flow_t *f[4];
+    for (int i = 0; i < 4; i++) {
+        f[i] = setup_flow(lane, &pcb[i], 8060 + i, &req[i], &stream[i], 1);
+        ASSERT_TRUE(f[i] != NULL, "stopped receiver fixture");
+        f[i]->downlink_paused = 1;
+        pcb[i].snd_queuelen = 128;
+    }
+    pcb[1].snd_wnd = 65535;    /* loss is not application backpressure */
+    f[2]->downlink_paused = 0; /* ordinary idle connection */
+    pcb[3].snd_queuelen = 0;   /* no queued data to reclaim */
+    ASSERT_EQ_INT(mqvpn_tcp_lane_tick(lane, 1000000), 0, "first zero observation");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_tick(lane, 10000000), 0, "short pause preserved");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_tick(lane, 11000000), 1, "10 s deadline");
+    ASSERT_TRUE(g_tcp_abort_last_pcb == &pcb[0], "only stopped receiver aborted");
+    ASSERT_TRUE(g_h3_close_last_req == &req[0], "matching H3 cancelled");
+    ASSERT_EQ_INT(lane->n_tcp_flows, 3, "positive window and idle flows preserved");
+    ASSERT_EQ_INT(lane->stats.pressure_evicted, 1, "backpressure cancellation counted");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_tick(lane, 22000000), 0, "no duplicate cancellation");
+    mqvpn_tcp_lane_free(lane);
+}
+
+static void
+test_stopped_receiver_progress_and_window_reset(void)
+{
+    relay_reset();
+    mqvpn_hybrid_config_t cfg;
+    mqvpn_hybrid_config_default(&cfg);
+    mqvpn_tcp_lane_t *lane = mqvpn_tcp_lane_new(&cfg, 0xdc11, NULL, fake_clock, NULL);
+    struct tcp_pcb pcb;
+    int req, stream;
+    mqvpn_tcp_flow_t *f = setup_flow(lane, &pcb, 8070, &req, &stream, 1);
+    ASSERT_TRUE(f != NULL, "progress fixture");
+    f->downlink_paused = 1;
+    pcb.snd_queuelen = 128;
+    mqvpn_tcp_lane_tick(lane, 1000000);
+    g_fake_now = 9000000;
+    ASSERT_EQ_INT(mqvpn_tcp_lane_on_lwip_sent(f, &pcb, 1), ERR_OK, "positive ACK");
+    ASSERT_EQ_INT(f->downlink_zero_window_since_us, 0, "ACK resets deadline");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_tick(lane, 10000000), 0, "slow reader preserved");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_tick(lane, 19000000), 0, "new observation grace");
+    pcb.snd_wnd = 65535;
+    ASSERT_EQ_INT(mqvpn_tcp_lane_tick(lane, 20000000), 0, "window reopened");
+    ASSERT_EQ_INT(f->downlink_zero_window_since_us, 0, "positive window clears age");
+    pcb.snd_wnd = 0;
+    mqvpn_tcp_lane_tick(lane, 21000000);
+    mqvpn_tcp_lane_tick(lane, 15000000);
+    ASSERT_EQ_INT(f->downlink_zero_window_since_us, 15000000,
+                  "clock regression relatches");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_tick(lane, 24000000), 0, "full grace after regression");
+    ASSERT_EQ_INT(mqvpn_tcp_lane_tick(lane, 25000000), 1,
+                  "eventual stopped receiver close");
+    ASSERT_EQ_INT(g_tcp_abort_calls, 1, "one TCP reset");
+    ASSERT_EQ_INT(g_h3_close_calls, 1, "one H3 cancellation");
+    mqvpn_tcp_lane_free(lane);
+}
+
+static void
 test_pressure_reclaims_only_old_paused_receiver(void)
 {
     relay_reset();
@@ -3951,6 +4017,8 @@ main(void)
     test_relay_lane_free_with_queued_backlog();
     test_relay_fin_during_pending_stream();
     test_stream_diagnostic_pause_and_resume();
+    test_stopped_receiver_deadline_without_pressure();
+    test_stopped_receiver_progress_and_window_reset();
     test_pressure_reclaims_only_old_paused_receiver();
     test_pressure_reclaim_resamples_between_victims();
     test_pressure_zero_window_reclaims_before_exhaustion();

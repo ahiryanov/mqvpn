@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Real H3 STREAM, original 4-tuple and selective return routing. Linux/root.
+# For ASan, bound its freed-memory quarantine so RSS checks measure the relay:
+# ASAN_OPTIONS=detect_leaks=1:quarantine_size_mb=16:thread_local_quarantine_size_kb=64
 # SOCKET_MATCH=iptables permits equivalent xt_socket testing on kernels without
 # CONFIG_NFT_SOCKET; the default exercises the documented production nft rules.
 set -euo pipefail
@@ -205,7 +207,7 @@ for _ in range(40):
     time.sleep(.1)
 quick_probe()
 d = diag()
-assert 128 * 1024 < d['h3_pending'] < 512 * 1024, ('unread H3 not visible', d)
+assert 14 * 1024**2 < d['h3_pending'] < 17 * 1024**2, ('unread H3 not visible', d)
 assert d['tcp_downlink_paused'] >= 1, ('paused TCP not visible', d)
 assert d['tcp_downlink_queue_blocks'] > 0, ('quota pause not visible', d)
 assert d['tcp_downlink_queued_pbufs'] > 0, ('TCP queue not visible', d)
@@ -237,7 +239,7 @@ time.sleep(4)
 aggregate_rx = transport_rx() - base_rx
 aggregate_rss = rss()
 print('four paused: transport_rx=%d rss=%d' % (aggregate_rx, aggregate_rss), flush=True)
-assert aggregate_rx < 44 * 1024**2, ('aggregate credit unbounded', aggregate_rx)
+assert aggregate_rx < 80 * 1024**2, ('aggregate credit unbounded', aggregate_rx)
 assert aggregate_rss < 200 * 1024**2, ('aggregate RSS unbounded', aggregate_rss)
 for q in flows: q.close()
 time.sleep(.5)
@@ -249,14 +251,40 @@ assert d['h3_pending'] == 0 and d['tcp_downlink_paused'] == 0, d
 assert d['tcp_downlink_resume_events'] > 0, d
 print('PASS: aggregate bounded; cancelled downloads release credit without reconnect')
 
+# One stopped reader must be reclaimed before aggregate pressure is possible.
+before = diag()
+q = socket.socket(); q.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+q.settimeout(5); q.connect(('192.168.100.50', 443)); q.sendall(b'D')
+receive_exact(q, 4096)
+try:
+    deadline = time.monotonic() + 16
+    while time.monotonic() < deadline:
+        d = diag()
+        assert d['recv_credit'] > 64 * 1024**2, ('unexpected pressure', d)
+        assert d['h3_pending'] < 192 * 1024**2, d
+        if d['tcp_pressure_evicted'] > before['tcp_pressure_evicted']:
+            break
+        quick_probe(); time.sleep(.5)
+    assert d['tcp_pressure_evicted'] == before['tcp_pressure_evicted'] + 1, d
+    cleanup_deadline = time.monotonic() + 5
+    while d['h3_pending'] and time.monotonic() < cleanup_deadline:
+        time.sleep(.1); d = diag()
+    assert d['h3_pending'] == 0, ('cancelled body retained', d)
+    assert 'stopped LAN receivers after 10 s' in (work / 'client.log').read_text()
+    quick_probe()
+    print('PASS: zero-window reader cancelled without aggregate pressure or VPN restart')
+finally:
+    q.close()
+
 # The office reproducer: many receivers retain data while independent fast
-# transfers and short probes must keep working. Run BEFORE cancelling any
-# slow receiver, so a reset/idle eviction cannot masquerade as recovery.
+# transfers and short probes keep working. Stopped downloads are cancelled
+# by policy; progressing slow readers must survive without payload corruption.
 paused, slow, threads = [], [], []
 stop = threading.Event()
 errors = []
 fast_bytes = [0]
 slow_bytes = [0]
+slow_progress = []
 
 def open_download():
     q = socket.socket()
@@ -265,17 +293,17 @@ def open_download():
     q.connect(('192.168.100.50', 443)); q.sendall(b'D')
     return q
 
-def slow_reader(q):
+def slow_reader(q, counter):
     got = 0
     try:
         while not stop.is_set():
             data = q.recv(2048)
-            if not data: break
+            assert data, ('slow receiver unexpectedly closed', got)
             expected = (block * 2)[got % len(block):got % len(block) + len(data)]
             assert data == expected, ('slow data corruption', got)
-            got += len(data); slow_bytes[0] += len(data)
+            got += len(data); slow_bytes[0] += len(data); counter[0] += len(data)
             stop.wait(1)
-    except OSError as e:
+    except Exception as e:
         if not stop.is_set(): errors.append(('slow', str(e)))
 
 def fast_reader():
@@ -295,11 +323,12 @@ def fast_reader():
 
 before = diag()
 try:
-    for _ in range(64):
+    for _ in range(8):
         q = open_download(); paused.append(q); receive_exact(q, 4096)
-    for _ in range(32):
+    for _ in range(4):
         q = open_download(); slow.append(q)
-        t = threading.Thread(target=slow_reader, args=(q,), daemon=True)
+        counter = [0]; slow_progress.append(counter)
+        t = threading.Thread(target=slow_reader, args=(q, counter), daemon=True)
         t.start(); threads.append(t)
     for _ in range(4):
         t = threading.Thread(target=fast_reader, daemon=True)
@@ -309,18 +338,18 @@ try:
     for _ in range(30):
         quick_probe(); successes += 1
         d = diag(); samples.append(d)
-        assert d['h3_pending'] <= 32 * 1024**2, ('H3 budget escaped', d)
-        assert rss() < 220 * 1024**2, ('client RSS escaped', rss())
+        assert d['h3_pending'] <= 256 * 1024**2 + 65536, ('H3 budget escaped', d)
+        assert rss() < 550 * 1024**2, ('client RSS escaped', rss())
         assert not errors, errors
         time.sleep(1)
     assert successes == 30
-    assert max(d['tcp_pressure_evicted'] for d in samples) == before['tcp_pressure_evicted'], ('unexpected pressure reset', samples[-1])
+    assert max(d['tcp_pressure_evicted'] for d in samples) >= before['tcp_pressure_evicted'] + 8, ('stopped receivers not cancelled', samples[-1])
     assert fast_bytes[0] >= 16 * 1024**2, ('no fast progress', fast_bytes)
-    assert slow_bytes[0] > 0
-    assert max(d['tcp_downlink_paused'] for d in samples) >= 64
+    assert all(c[0] >= 32768 for c in slow_progress), ('slow reader lost', slow_progress)
+    assert max(d['tcp_downlink_paused'] for d in samples) >= 4
     assert max(d['tcp_downlink_queued_pbufs'] for d in samples) < 8192
     assert max(d['tcp_downlink_queue_blocks'] for d in samples) > before['tcp_downlink_queue_blocks']
-    print('PASS: 64 paused + 32 slow readers coexist with fast byte-exact downloads; '
+    print('PASS: 8 stopped + 4 progressing slow readers coexist with fast byte-exact downloads; '
           '30/30 independent probes; fast_bytes=%d peak_h3=%d peak_tcp_pbufs=%d' %
           (fast_bytes[0], max(d['h3_pending'] for d in samples),
            max(d['tcp_downlink_queued_pbufs'] for d in samples)), flush=True)
@@ -336,34 +365,34 @@ quick_probe()
 assert not errors, errors
 print('PASS: mixed-load connections cleaned up without VPN restart')
 
-# Overcommit the 32 MiB aggregate window deliberately. With all recipients
+# Overcommit the 256 MiB aggregate window deliberately. With all recipients
 # stopped, no policy can preserve every connection AND grant new data credit.
 # The oldest no-ACK receiver must be cancelled without reconnecting the VPN.
 holders = []
 before = diag()
 try:
-    for _ in range(144):
+    for _ in range(48):
         q = open_download(); holders.append(q)
     deadline = time.monotonic() + 60
-    exhausted = False
+    pressured = False
     restored = False
     peak_pending = 0
     failed_probes = 0
     while time.monotonic() < deadline:
         d = diag()
         peak_pending = max(peak_pending, d['h3_pending'])
-        exhausted |= d['recv_credit'] < 16384 and d['h3_pending'] >= 16 * 1024**2
-        assert rss() < 220 * 1024**2, ('saturated client RSS escaped', rss())
+        pressured |= d['recv_credit'] < 64 * 1024**2 and d['h3_pending'] >= 192 * 1024**2
+        assert rss() < 550 * 1024**2, ('saturated client RSS escaped', rss())
         try:
             quick_probe()
-            if exhausted and d['tcp_pressure_evicted'] > before['tcp_pressure_evicted']:
+            if pressured and d['tcp_pressure_evicted'] > before['tcp_pressure_evicted']:
                 restored = True
                 break
         except (OSError, AssertionError):
             failed_probes += 1
         time.sleep(1)
     d = diag()
-    assert exhausted, ('fixture never exhausted aggregate credit', d)
+    assert pressured, ('fixture never pressured aggregate credit', d)
     assert restored, ('no bounded pressure recovery', d)
     assert d['tcp_pressure_evicted'] > before['tcp_pressure_evicted'], d
     print('PASS: aggregate saturation recovers without reconnect; '

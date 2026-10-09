@@ -296,7 +296,7 @@ streams as well as hybrid TCP streams.
 | `tcp_downlink_retry_calls`, `tcp_downlink_sndbuf_blocks`, `tcp_downlink_err_mem` | Cumulative stash retry calls, insufficient-send-buffer gates and TCP write ERR_MEM returns; retries can contribute repeatedly. |
 | `tcp_downlink_h3_again` | Cumulative H3 reads with no data available; normally nonzero, not itself an error. |
 | `tcp_downlink_queue_blocks` | Cumulative pauses/retries at the per-flow share of the TCP segment pool. |
-| `tcp_pressure_evicted` | Cumulative oldest-receiver cancellations when receive credit is below 8 MiB and unread H3 DATA is at least 24 MiB; at least 5 s paused without ACK progress with an advertised zero TCP window, otherwise 30 s. The exhaustion fallback below 16 KiB credit and at least 16 MiB unread DATA remains. |
+| `tcp_pressure_evicted` | Cumulative targeted receiver cancellations: queued, paused downloads observed with zero TCP window for 10 s without positive ACK progress, independently of pressure; plus the oldest-receiver fallback when credit is below 64 MiB and unread H3 DATA is at least 192 MiB (5 s paused without ACK progress for zero TCP window, otherwise 30 s). Exhaustion fallback: below 16 KiB credit and at least 128 MiB unread DATA. |
 | `tcp_downlink_queued_pbufs` | Current pbufs queued across lane-owned TCP PCBs, including unsent/unacknowledged data; not the full global lwIP pool. |
 
 Gauges are recomputed when queried; relay counters last for the TCP lane's

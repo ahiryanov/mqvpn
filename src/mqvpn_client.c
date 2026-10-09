@@ -5238,7 +5238,12 @@ mqvpn_client_tick(mqvpn_client_t *c)
      * depends on the other having just run). */
     if (c->conn && c->conn->tcp_lane) {
         uint64_t now = client_now_us(c);
-        mqvpn_tcp_lane_tick(c->conn->tcp_lane, now);
+        uint32_t stalled = mqvpn_tcp_lane_tick(c->conn->tcp_lane, now);
+        if (stalled)
+            LOG_W(c,
+                  "TCP STREAM: closed %u stopped LAN receivers after 10 s; "
+                  "zero TCP window without ACK progress",
+                  stalled);
         if (now - c->conn->pressure_check_us >= 125000ULL) {
             c->conn->pressure_check_us = now;
             xqc_conn_stats_t xs = xqc_conn_get_stats(c->engine, &c->conn->cid);
