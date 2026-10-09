@@ -105,6 +105,26 @@ json_read_string(const char *p, char *out, size_t out_len)
     return 0;
 }
 
+/* Read a JSON string without silently truncating it.  Credential identities
+ * use this variant because two distinct overlong names must never collapse to
+ * the same fixed-size principal.  Escape handling intentionally mirrors
+ * json_read_string(): the escaped byte is copied without the backslash. */
+static inline int
+json_read_string_strict(const char *p, char *out, size_t out_len)
+{
+    if (!p || !out || out_len == 0 || *p != '"') return -1;
+    p++;
+    size_t j = 0;
+    while (*p && *p != '"') {
+        if (*p == '\\' && p[1]) p++;
+        if (j + 1 >= out_len) return -1;
+        out[j++] = *p++;
+    }
+    if (*p != '"') return -1;
+    out[j] = '\0';
+    return 0;
+}
+
 /* Read a JSON boolean value. Returns 0 on success, -1 on error. */
 static inline int
 json_read_bool(const char *p, int *out)
@@ -224,10 +244,11 @@ mqvpn_json_parse_users(const char *arr, void *ctx,
 
         if (*p == '"') {
             char pair[360] = {0};
-            if (json_read_string(p, pair, sizeof(pair)) < 0) return -1;
+            if (json_read_string_strict(p, pair, sizeof(pair)) < 0) return -1;
             char *sep = strchr(pair, ':');
             if (!sep) return -1;
             *sep = '\0';
+            if (strlen(pair) >= sizeof(name) || strlen(sep + 1) >= sizeof(key)) return -1;
             mqvpn_copy_str(name, sizeof(name), pair);
             mqvpn_copy_str(key, sizeof(key), sep + 1);
 
@@ -251,8 +272,8 @@ mqvpn_json_parse_users(const char *arr, void *ctx,
             const char *name_v = json_find_key(obj, "name");
             const char *key_v = json_find_key(obj, "key");
             if (!name_v || !key_v) return -1;
-            if (json_read_string(name_v, name, sizeof(name)) < 0) return -1;
-            if (json_read_string(key_v, key, sizeof(key)) < 0) return -1;
+            if (json_read_string_strict(name_v, name, sizeof(name)) < 0) return -1;
+            if (json_read_string_strict(key_v, key, sizeof(key)) < 0) return -1;
 
             const char *fip_v = json_find_key(obj, "fixed_ip");
             if (fip_v) json_read_string(fip_v, fixed_ip, sizeof(fixed_ip));
