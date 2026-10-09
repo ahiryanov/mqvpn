@@ -40,6 +40,12 @@ typedef struct {
     size_t path_len;
     const char *auth_token; /* Bearer payload, not NUL-terminated */
     size_t auth_token_len;
+    const char *src_ip;
+    size_t src_ip_len;
+    const char *src_port;
+    size_t src_port_len;
+    unsigned src_ip_count, src_port_count;
+    int tcp_headers_invalid; /* duplicate routing/auth headers */
     char x_user[64]; /* x-user header value, NUL-terminated */
     int has_reorder_hdr; /* request advertised mqvpn-reorder (§19.3). Applied to
                           * conn->peer_reorder_supported ONLY when this request
@@ -47,6 +53,11 @@ typedef struct {
                           * duplicate or unrelated request must not mutate the
                           * live tunnel's negotiated stamping. */
 } svr_req_headers_t;
+
+int svr_tcp_transparent_enabled(const mqvpn_server_t *s);
+int svr_tcp_source_authorized(void *stream, const char *username,
+                              uint8_t family, const uint8_t *source);
+void *svr_stream_conn(void *stream);
 
 /* Whether request-level auth (Bearer PSK) must be checked before granting a
  * MASQUE request. Identical condition for CONNECT-IP and connect-tcp on

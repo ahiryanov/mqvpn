@@ -28,6 +28,7 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* X-macro row: X(code, "SYMBOLIC_NAME"). Values/names mirror xqc_errno.h's
@@ -185,6 +186,33 @@ mqvpn_xquic_annotate_err_codes(const char *in, size_t in_len, char *out, size_t 
 
     out[oi] = '\0';
     return oi;
+}
+
+/* Routine per-request shutdown is DEBUG detail, not a tunnel failure.
+ * `msg` is the NUL-terminated, annotated line produced above. Keep other
+ * REPORT records and unexpected H3 errors at their original severity. */
+static inline int
+mqvpn_xquic_log_is_routine(xqc_log_level_t lvl, const char *msg)
+{
+    if (lvl == XQC_LOG_ERROR &&
+        (strstr(msg, "|xqc_h3_stream_process_data|xqc_stream_recv error|-626|") ||
+         strstr(msg, "|xqc_h3_stream_process_blocked_data|xqc_stream_recv error|-626|")))
+        return 1; /* -XQC_ESTREAM_RESET */
+
+    if (lvl == XQC_LOG_REPORT && strstr(msg, "|xqc_h3_request_destroy|")) {
+        const char *err = strstr(msg, "|err:");
+        if (!err) return 0;
+        char *end;
+        unsigned long code = strtoul(err + 5, &end, 0);
+        if (end == err + 5) return 0;
+        if (*end == '(') {
+            char *close = strchr(end, ')');
+            end = close ? close + 1 : NULL;
+        }
+        return end && *end == '|' &&
+               (code == TRA_NO_ERROR || code == H3_REQUEST_CANCELLED);
+    }
+    return 0;
 }
 
 /* Compile-time coverage: -Wswitch (built -Werror, see AGENTS.md G11) turns a

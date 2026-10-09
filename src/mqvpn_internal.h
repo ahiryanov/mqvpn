@@ -17,7 +17,8 @@
 #include <stdbool.h>
 
 /* ─── Constants ─── */
-/* MQVPN_MAX_PATHS and MQVPN_MAX_USERS are defined in libmqvpn.h */
+/* MQVPN_MAX_PATHS, MQVPN_MAX_USERS and MQVPN_MAX_ROUTES are defined in
+ * libmqvpn.h. */
 
 /* Mirror of xquic's private xqc_path_state_t (third_party/xquic/
  * src/transport/xqc_multipath.h). The library links shared xquic and sees
@@ -93,6 +94,12 @@ struct mqvpn_config_s {
     char user_keys[MQVPN_MAX_USERS][256];
     char user_fixed_ips[MQVPN_MAX_USERS][20]; /* "" = dynamic, "x.x.x.x" = pinned */
     int n_users;
+    /* Server-side native routed prefixes. Entries are canonical/pre-masked;
+     * route_users stores stable names rather than indexes because user removal
+     * compacts the user arrays. */
+    mqvpn_cidr_entry_t route_prefixes[MQVPN_MAX_ROUTES];
+    char route_users[MQVPN_MAX_ROUTES][64];
+    int n_routes;
     int insecure;
     /* Client: server SPKI SHA-256 pins (PinnedPubkey); n == 0 = no pinning. */
     uint8_t pinned_pubkeys[MQVPN_MAX_PINNED_PUBKEYS][MQVPN_PIN_LEN];
@@ -414,5 +421,47 @@ MQVPN_INTERNAL int mqvpn_server_get_client_reinject(const mqvpn_server_t *s,
  * possibly n_paths==0) or 0 (not connected); -1 only for bad arguments. */
 MQVPN_INTERNAL int mqvpn_client_get_reinject(const mqvpn_client_t *c,
                                              mqvpn_internal_client_reinject_t *out);
+
+/* Internal diagnostic side channel: keeps mqvpn_stats_t's public ABI
+ * unchanged. available=0 means no established upstream (also server mode).
+ * All byte counts are payload/offset measurements, not allocator totals. */
+typedef struct {
+    int available;
+    uint64_t recv_limit;
+    uint64_t recv_used;
+    uint64_t recv_read;
+    uint64_t h3_pending;
+    uint64_t recv_credit;
+    uint64_t recv_window;
+    uint64_t recv_window_update_age_ms;
+    uint64_t send_limit;
+    uint64_t send_used;
+    uint64_t send_credit;
+    uint64_t send_blocked;
+    uint64_t tcp_pending_accept;
+    uint64_t tcp_pending_stream;
+    uint64_t tcp_established;
+    uint64_t tcp_closing;
+    uint64_t tcp_downlink_paused;
+    uint64_t tcp_uplink_withheld;
+    uint64_t tcp_downlink_stash_bytes;
+    uint64_t tcp_uplink_queued_bytes;
+    uint64_t tcp_downlink_pause_max_ms;
+    uint64_t tcp_downlink_h3_bytes;
+    uint64_t tcp_downlink_tcp_bytes;
+    uint64_t tcp_downlink_acked_bytes;
+    uint64_t tcp_downlink_pause_events;
+    uint64_t tcp_downlink_resume_events;
+    uint64_t tcp_downlink_retry_calls;
+    uint64_t tcp_downlink_sndbuf_blocks;
+    uint64_t tcp_downlink_err_mem;
+    uint64_t tcp_downlink_h3_again;
+    uint64_t tcp_downlink_queue_blocks;
+    uint64_t tcp_downlink_queued_pbufs;
+    uint64_t tcp_pressure_evicted;
+} mqvpn_internal_stream_diag_t;
+
+MQVPN_INTERNAL int mqvpn_client_get_stream_diag(const mqvpn_client_t *c,
+                                                mqvpn_internal_stream_diag_t *out);
 
 #endif /* MQVPN_INTERNAL_H */

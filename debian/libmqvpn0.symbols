@@ -38,6 +38,8 @@ libmqvpn.so.4 libmqvpn0 #MINVER#
  mqvpn_client_tick@Base 0.16.3
  mqvpn_config_add_path_policy@Base 0.16.3
  mqvpn_config_add_reorder_rule@Base 0.16.3
+ mqvpn_config_add_route@Base 0.16.3
+ mqvpn_config_set_tcp_transparent@Base 0.16.3
  mqvpn_config_add_user@Base 0.16.3
  mqvpn_config_free@Base 0.16.3
  mqvpn_config_load_json@Base 0.16.3

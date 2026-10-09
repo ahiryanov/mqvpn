@@ -241,7 +241,7 @@ datagram counters and uptime.
 | `uptime_sec` | uint64  | Seconds since `mqvpn_server_create` was called (server) / `mqvpn_client_new` was called (client) — process uptime, not "seconds connected". |
 
 Notes:
-- **All fields in this command are now wired for both modes** (fixed after
+- **All top-level traffic fields in this command are wired for both modes** (fixed after
   being silently server-only for several releases — see §7). Previously,
   every field except `udp_rx_receives`/`udp_rx_datagrams` (sourced from the
   platform layer, not `mqvpn_stats_t`) read `0` in client mode regardless of
@@ -262,6 +262,51 @@ Notes:
   config keys that control this behavior.
 
 ---
+
+### STREAM diagnostic snapshot in `get_stats`
+
+`stream_diag` is an additive object. Existing top-level fields and commands
+are unchanged. It is read-only, has no configuration switch and emits no
+per-flow log messages. Poll it every 10 seconds for stall investigation.
+`available` is `1` only for an established client connection; it is `0`
+(with zero values) before connection and in server mode. The remote server
+does not need this diagnostic build. Rebuild the client and its pinned
+xquic together: xquic's connection-stats struct has grown; do not mix the
+old shared library with the new executable/library.
+
+All values below are unsigned integers. Byte measurements are payload or
+QUIC offsets, not total heap/RSS usage. The connection includes H3 control
+streams as well as hybrid TCP streams.
+
+| Field in `stream_diag` | Meaning |
+|---|---|
+| `recv_limit`, `recv_used`, `recv_read` | Cumulative advertised receive MAX_DATA, used receive offsets and transport-delivered bytes. Used offsets include gaps/final sizes; this is not a wire byte count. |
+| `h3_pending` | H3 DATA retained until the application reads or cancels it, summed across the connection. |
+| `recv_credit` | `max(0, recv_limit - recv_used)`: remaining credit available to the peer. This is **not** the receive window minus application-consumed bytes. |
+| `recv_window` | Current target connection receive window. |
+| `recv_window_update_age_ms` | Time since the last receive-window update, using the injected connection clock. Zero if none has occurred. |
+| `send_limit`, `send_used`, `send_credit` | Peer-advertised MAX_DATA, used send offsets and their clamped difference. |
+| `send_blocked` | Local connection DATA_BLOCKED flag, 0 or 1; distinct from lack of congestion-window space. |
+| `tcp_pending_accept`, `tcp_pending_stream`, `tcp_established`, `tcp_closing` | Current flow-table state counts. Closing routing markers are excluded from `tcp_flows_active`. Sticky RAW markers are excluded from all relay gauges. |
+| `tcp_downlink_paused`, `tcp_uplink_withheld` | Current flows paused on TCP output, and flows withholding TCP receive credit on upload. |
+| `tcp_downlink_stash_bytes`, `tcp_uplink_queued_bytes` | Bytes already read from H3 awaiting TCP write, and upload bytes not yet accepted by H3. The stash is separate from `h3_pending`. |
+| `tcp_downlink_pause_max_ms` | Longest currently uninterrupted output pause. A failed retry does not reset it; a successful retry clears it. This is not an idle timeout or a confirmed dead-flow count. |
+| `tcp_downlink_h3_bytes`, `tcp_downlink_tcp_bytes`, `tcp_downlink_acked_bytes` | Cumulative DATA consumed from H3, successfully queued to TCP, and acknowledged by LAN receivers. Failed writes/retries do not count as progress. |
+| `tcp_downlink_pause_events`, `tcp_downlink_resume_events` | Cumulative transitions into/out of an output pause. Flow cancellation is not a resume. |
+| `tcp_downlink_retry_calls`, `tcp_downlink_sndbuf_blocks`, `tcp_downlink_err_mem` | Cumulative stash retry calls, insufficient-send-buffer gates and TCP write ERR_MEM returns; retries can contribute repeatedly. |
+| `tcp_downlink_h3_again` | Cumulative H3 reads with no data available; normally nonzero, not itself an error. |
+| `tcp_downlink_queue_blocks` | Cumulative pauses/retries at the per-flow share of the TCP segment pool. |
+| `tcp_pressure_evicted` | Cumulative oldest-receiver cancellations when receive credit is below 8 MiB and unread H3 DATA is at least 24 MiB; at least 5 s paused without ACK progress with an advertised zero TCP window, otherwise 30 s. The exhaustion fallback below 16 KiB credit and at least 16 MiB unread DATA remains. |
+| `tcp_downlink_queued_pbufs` | Current pbufs queued across lane-owned TCP PCBs, including unsent/unacknowledged data; not the full global lwIP pool. |
+
+Gauges are recomputed when queried; relay counters last for the TCP lane's
+lifetime and reset on reconnect. QUIC offsets/window values belong to the
+current connection. Compare snapshots from the same connection/process.
+A growing `h3_pending` with near-zero `recv_credit` supports connection
+credit starvation. Growing pause age/stash with no increase in TCP/ACK
+bytes and **available** receive credit instead points toward the relay or
+LAN recipient. These are diagnostic clues, not automatic restart rules.
+The snapshot alone does not establish the underlying defect.
 
 ### 5.5 `get_status`
 
@@ -737,6 +782,7 @@ keys are the snake_case column below.
 | `Enabled`               | `enabled`                 | bool    | `false` | client + server | Turn hybrid mode on. Disabled by default — existing deployments see no behavior change. |
 | `Tcp`                   | `tcp`                     | string  | `auto`  | client only     | Per-flow TCP lane policy: `stream` (always relay via the TCP lane), `raw` (never — inner TCP stays on the CONNECT-IP datagram path, byte-identical to hybrid disabled), or `auto` (per-flow: TCP lane once ≥2 paths are active at SYN time, RAW otherwise; the decision is latched for the flow's lifetime, never re-evaluated). |
 | `TcpMaxFlows`           | `tcp_max_flows`           | uint32  | `256`   | client + server | Cap on concurrently open TCP-lane flows. Client: caps the local flow table (a SYN over the cap falls back to RAW pre-lwIP, counted in `tcp_flows_rejected`). Server: caps concurrent egress flows per client session (a SYN over the cap gets an HTTP `503`). On the client the honored value is additionally clamped to half the build profile's lwIP pcb pool — 4096 on desktop/router, 256 on Android, 64 on iOS — and the clamp is logged at startup and at lane creation. Raising it for a router deployment needs the matching raise on the **server** too, since the per-session cap here is enforced independently on each side. |
+| `Transparent`           | `transparent`            | bool    | `false` | client + server | Preserve the original IPv4 source IP and TCP port for STREAM flows. Requires authenticated source ownership and Linux transparent socket return routing; enable on both peers. See [setup and compatibility](transparent-hybrid-tcp.md). |
 | `TcpIdleTimeoutSec`     | `tcp_idle_timeout_sec`    | uint32  | `300`   | client + server | Idle-eviction timeout for TCP-lane flows (no activity for this long tears the flow down). `0` disables idle eviction (flows live for the whole connection lifetime). |
 | `TcpConnectTimeoutSec`  | `tcp_connect_timeout_sec` | uint32  | `10`    | server only     | Timeout for the server's egress `connect()` to the requested target; on expiry the client gets an HTTP `504`. |
 | `TcpMaxGlobalFlows`     | `tcp_max_global_flows`    | uint32  | `4096`  | server only     | Whole-server cap on concurrent egress TCP flows, across all client sessions (independent of the per-session `TcpMaxFlows`). A SYN over the cap gets an HTTP `503`. |
