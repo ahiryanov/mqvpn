@@ -386,6 +386,28 @@ mqvpn_tcp_lane_on_syn(mqvpn_tcp_lane_t *lane, const mqvpn_flow_key_t *key, int t
     return 0;
 }
 
+/* Application policy, not a TCP liveness test: cancel a queued download
+ * whose LAN receiver has stopped accepting bytes. Sample alongside the
+ * existing 1 Hz retry sweep; neither uplink traffic nor retries extend it.
+ * RFC 9000 sections 4.1/4.4: advertised credit cannot be revoked; close the
+ * individual H3 request through the existing cancellation/accounting path. */
+static int
+tcp_lane_zero_window_expired(mqvpn_tcp_flow_t *f, uint64_t now_us)
+{
+    if (f->state != TCP_FLOW_ACTIVE || !f->downlink_paused || !f->pcb ||
+        f->pcb->snd_wnd != 0 || (!tcp_sndqueuelen(f->pcb) && !f->downlink_stash_len)) {
+        f->downlink_zero_window_since_us = 0;
+        return 0;
+    }
+    if (!f->downlink_zero_window_since_us || now_us < f->downlink_zero_window_since_us) {
+        f->downlink_zero_window_since_us = now_us;
+        return 0;
+    }
+    return now_us - f->downlink_zero_window_since_us >= 10000000ULL &&
+           now_us >= f->downlink_last_ack_us &&
+           now_us - f->downlink_last_ack_us >= 10000000ULL;
+}
+
 /* Idle-timeout eviction sweep + CLOSING routing-marker grace
  * sweep (C1) — one bucket walk serves both. Runs from mqvpn_client_tick,
  * i.e. neither a lwIP-invoked frame nor an xquic-context notify: this is a
@@ -395,20 +417,14 @@ mqvpn_tcp_lane_on_syn(mqvpn_tcp_lane_t *lane, const mqvpn_flow_key_t *key, int t
  * the idle-eviction status is simply discarded (void-cast), same as
  * on_stream_rejected/on_h3_closing/on_h3_writable above.
  *
- * The two sweeps are independently gated: cfg.tcp_idle_timeout_sec == 0
- * ("never evict" — classifier.h's field comment documents tcp_lane as the
- * consumer; a deliberate opt-out, e.g. a deployment that wants tcp=stream
- * flows to live for the whole connection lifetime, not an instant-timeout
- * footgun) disables ONLY the idle-eviction half. The CLOSING grace sweep
- * is a DIFFERENT mechanism with a different rationale (bounding routing-
- * marker residency, not relay-flow idleness) and must keep running
- * regardless — see the doc note below for why this matters even when
- * tcp_idle_timeout_sec == 0. */
-void
+ * tcp_idle_timeout_sec == 0 disables general idle eviction only. The
+ * CLOSING residency bound and the queued zero-window receiver deadline
+ * still apply: neither is a test for ordinary connection idleness. */
+uint32_t
 mqvpn_tcp_lane_tick(mqvpn_tcp_lane_t *lane, uint64_t now_us)
 {
     if (!lane) {
-        return;
+        return 0;
     }
     /* Nothing evictable by EITHER sweep: markers (STICKY_RAW) are excluded
      * from both regardless of population, so an idle lane with no
@@ -424,10 +440,10 @@ mqvpn_tcp_lane_tick(mqvpn_tcp_lane_t *lane, uint64_t now_us)
      * is a SEPARATE, pre-existing tradeoff of the 0 opt-out (not something
      * C1's n_closing accounting mitigates — n_closing only tracks CLOSING
      * routing markers, which PENDING_ACCEPT flows never become); documented
-     * here rather than changed, since 0 is an intentional "never evict my
-     * relay flows" choice a deployment opts into. */
+     * here rather than changed, since 0 disables general idle eviction. The
+     * queued zero-window policy remains active regardless of that setting. */
     if (lane->n_tcp_flows == 0 && lane->n_closing == 0) {
-        return;
+        return 0;
     }
     /* Cadence gate: the caller (mqvpn_client_tick) fires per event-loop
      * iteration — including after every recv batch, i.e. potentially
@@ -442,9 +458,10 @@ mqvpn_tcp_lane_tick(mqvpn_tcp_lane_t *lane, uint64_t now_us)
      * independently underflow-guarded), and it self-heals by re-latching
      * last_sweep_us to the new clock. */
     if (now_us - lane->last_sweep_us < 1000000ULL) {
-        return;
+        return 0;
     }
     lane->last_sweep_us = now_us;
+    uint32_t stalled = 0;
     int idle_evict_enabled = lane->cfg.tcp_idle_timeout_sec != 0;
     uint64_t idle_us = (uint64_t)lane->cfg.tcp_idle_timeout_sec * 1000000ULL;
     for (uint32_t b = 0; b < lane->n_buckets; b++) {
@@ -465,6 +482,10 @@ mqvpn_tcp_lane_tick(mqvpn_tcp_lane_t *lane, uint64_t now_us)
                     now_us - f->last_activity_us > TCP_LANE_CLOSING_GRACE_US) {
                     tcp_lane_remove_flow(lane, f);
                 }
+            } else if (tcp_lane_zero_window_expired(f, now_us)) {
+                lane->stats.pressure_evicted++;
+                stalled++;
+                (void)tcp_lane_teardown_flow(f, /*close_h3=*/1);
             } else if (idle_evict_enabled && f->state != TCP_FLOW_STICKY_RAW &&
                        now_us > f->last_activity_us &&
                        now_us - f->last_activity_us > idle_us) {
@@ -535,6 +556,7 @@ mqvpn_tcp_lane_tick(mqvpn_tcp_lane_t *lane, uint64_t now_us)
             f = next;
         }
     }
+    return stalled;
 }
 
 void
@@ -611,7 +633,7 @@ mqvpn_tcp_lane_relieve_pressure(mqvpn_tcp_lane_t *lane, uint64_t now_us, uint64_
                                 uint64_t pending)
 {
     /* The caller resamples credit after engine progress before selecting
-     * another victim. A large autotuned stream can free enough by itself;
+     * another victim. A large stream can free enough by itself;
      * stale aggregate counters must not cancel an entire batch. */
     return tcp_lane_relieve_one(lane, now_us, credit, pending);
 }
@@ -894,6 +916,7 @@ resumed:
     f->lane->stats.downlink_resume_events++;
     f->downlink_paused = 0;
     f->downlink_pause_since_us = 0;
+    f->downlink_zero_window_since_us = 0;
     return TCP_LANE_FLOW_LIVE;
 }
 
@@ -994,7 +1017,10 @@ mqvpn_tcp_lane_on_lwip_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
      * paused; retry attempts and unrelated uplink bytes do not. */
     if (f->lane && f->lane->clock_fn) {
         f->last_activity_us = f->lane->clock_fn(f->lane->clock_ctx);
-        if (len) f->downlink_last_ack_us = f->last_activity_us;
+        if (len) {
+            f->downlink_last_ack_us = f->last_activity_us;
+            f->downlink_zero_window_since_us = 0;
+        }
     }
 
     if (!f->downlink_paused) {

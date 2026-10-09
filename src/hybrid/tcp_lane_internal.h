@@ -182,6 +182,7 @@ typedef struct mqvpn_tcp_flow {
     int downlink_paused;
     uint64_t downlink_pause_since_us;
     uint64_t downlink_last_ack_us; /* positive ACK progress, not retry activity */
+    uint64_t downlink_zero_window_since_us; /* first stalled 1 Hz observation */
     int fin_sent_to_h3;
     int fin_received_from_h3;
     int tcp_fin_seen;

@@ -88,9 +88,14 @@ numbers are in
 ## Receive backpressure
 
 Unread HTTP/3 bodies now retain the peer's receive credit. If an inner TCP
-receiver stops reading, the sender eventually stops sending over the VPN;
-reading again resumes the same transfer. Each stream starts with 256 KiB
-of receive credit and can grow to 16 MiB. The aggregate receive window is
+receiver stops reading, the sender eventually stops sending over the VPN.
+Each stream has a fixed 16 MiB receive window from the start. The client
+cancels a queued, paused download after observing a zero TCP receive window
+for 10 seconds without newly acknowledged bytes, even when the shared budget
+is healthy. Reading again before that deadline resumes the same transfer;
+after cancellation the application must reconnect. Slow readers making ACK
+progress, positive-window loss and ordinary idle connections are preserved
+by this deadline. The aggregate receive window is
 at most 256 MiB per QUIC connection and direction, plus a small parser
 allowance. These bound receive credit, not total process memory: lwIP, kernel
 sockets, packets, metadata and other connections also use memory. Several

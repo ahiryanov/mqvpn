@@ -553,9 +553,11 @@ int mqvpn_tcp_lane_on_syn(mqvpn_tcp_lane_t *lane, const mqvpn_flow_key_t *key, i
  * lookup call's signature for a value almost no caller needs. */
 uint32_t mqvpn_tcp_lane_marker_isn(mqvpn_tcp_lane_t *lane, const mqvpn_flow_key_t *key);
 
-/* Idle-timeout sweep + CLOSING grace-sweep + stats snapshot, called from
- * tick() (C1). */
-void mqvpn_tcp_lane_tick(mqvpn_tcp_lane_t *lane, uint64_t now_us);
+/* Idle/CLOSING sweeps and 1 Hz stalled-receiver check. Returns the number
+ * of queued, paused zero-window downloads cancelled after 10 s without
+ * positive ACK progress, even without aggregate pressure. This policy also
+ * applies with tcp_idle_timeout_sec == 0; ordinary idle flows are preserved. */
+uint32_t mqvpn_tcp_lane_tick(mqvpn_tcp_lane_t *lane, uint64_t now_us);
 /* Under aggregate receive-credit pressure, abort at most one oldest paused
  * receiver without ACK progress: 5 s with zero TCP window, otherwise 30 s.
  * Caller allows engine progress, resamples credit, and gates to 8 Hz; never
