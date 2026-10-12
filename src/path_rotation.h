@@ -14,7 +14,8 @@
  *
  * Iterates forward (wrapping) from cur_idx+1, skipping any path whose
  * flags have MQVPN_PATH_FLAG_BACKUP set.  Returns the new index, or
- * cur_idx unchanged when there is ≤1 non-backup path (nothing to rotate to).
+ * cur_idx unchanged when there are no non-backup paths. A sole non-backup
+ * path is selected even when cur_idx points to an excluded path.
  *
  * @cur_idx    current primary path index (0-based)
  * @path_flags array of per-path flag words, length n_paths

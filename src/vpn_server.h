@@ -5,6 +5,7 @@
 #define MQVPN_VPN_SERVER_H
 
 #include <stdint.h>
+#include "libmqvpn.h" /* MQVPN_MAX_ROUTES */
 #ifdef _WIN32
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
@@ -30,6 +31,11 @@ typedef struct {
     uint64_t dscp_mask;
 } mqvpn_path_policy_entry_t;
 
+typedef struct {
+    char user[64];
+    char prefix[56];
+} mqvpn_route_cfg_entry_t;
+
 typedef struct mqvpn_server_cfg_s {
     const char *listen_addr;        /* bind address (e.g. "0.0.0.0") */
     int listen_port;                /* bind port (e.g. 443) */
@@ -48,6 +54,8 @@ typedef struct mqvpn_server_cfg_s {
     const char *user_keys[64];
     const char *user_fixed_ips[64]; /* NULL or "" = dynamic, "x.x.x.x" = pinned */
     int n_users;
+    mqvpn_route_cfg_entry_t routes[MQVPN_MAX_ROUTES];
+    int n_routes;
     int max_clients;           /* max concurrent clients (default 64) */
     const char *control_addr;  /* bind address for JSON control API (default 127.0.0.1) */
     int control_port;          /* TCP port for JSON control API (0 = disabled) */
