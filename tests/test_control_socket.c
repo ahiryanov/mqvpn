@@ -69,6 +69,15 @@ static int g_all_fec_n = 0;
 
 static int g_reorder_rc = 0;
 
+static mqvpn_internal_stream_diag_t g_stream_diag;
+int
+mqvpn_client_get_stream_diag(const mqvpn_client_t *c, mqvpn_internal_stream_diag_t *out)
+{
+    (void)c;
+    *out = g_stream_diag;
+    return MQVPN_OK;
+}
+
 /* ── Server API stubs ────────────────────────────────────────────────────── */
 int mqvpn_server_add_user(mqvpn_server_t *s, const char *n, const char *k)
 { (void)s; (void)n; (void)k; return g_add_user_rc; }
@@ -637,6 +646,7 @@ TEST(get_stats)
     ASSERT_CONTAINS(resp, "\"ok\":true");
     ASSERT_CONTAINS(resp, "\"n_clients\":3");
     ASSERT_CONTAINS(resp, "\"bytes_tx\":111");
+    ASSERT_CONTAINS(resp, "\"stream_diag\":{\"available\":0");
     ASSERT_CONTAINS(resp, "\"tcp_flows_total\":7");
     ASSERT_CONTAINS(resp, "\"uptime_sec\":4242");
     /* Offload counters reach the JSON from BOTH sources: udp_tx_* through
@@ -662,6 +672,12 @@ TEST(get_stats)
 TEST(get_stats_client_mode_connected)
 {
     memset(&g_cli_stats_tmpl, 0, sizeof(g_cli_stats_tmpl));
+    memset(&g_stream_diag, 0, sizeof(g_stream_diag));
+    g_stream_diag.available = 1;
+    g_stream_diag.h3_pending = 34567;
+    g_stream_diag.recv_credit = 0;
+    g_stream_diag.tcp_downlink_paused = 2;
+    g_stream_diag.tcp_downlink_tcp_bytes = 123456;
     g_cli_stats_tmpl.bytes_tx = 222;
     g_cli_stats_tmpl.tcp_flows_total = 9;
     g_cli_stats_tmpl.udp_tx_sends = 4321;
@@ -674,6 +690,11 @@ TEST(get_stats_client_mode_connected)
     ASSERT_CONTAINS(resp, "\"ok\":true");
     ASSERT_CONTAINS(resp, "\"n_clients\":1");
     ASSERT_CONTAINS(resp, "\"bytes_tx\":222");
+    ASSERT_CONTAINS(resp, "\"stream_diag\":{\"available\":1");
+    ASSERT_CONTAINS(resp, "\"h3_pending\":34567");
+    ASSERT_CONTAINS(resp, "\"recv_credit\":0");
+    ASSERT_CONTAINS(resp, "\"tcp_downlink_paused\":2");
+    ASSERT_CONTAINS(resp, "\"tcp_downlink_tcp_bytes\":123456");
     ASSERT_CONTAINS(resp, "\"tcp_flows_total\":9");
     ASSERT_CONTAINS(resp, "\"uptime_sec\":1010");
     ASSERT_CONTAINS(resp, "\"udp_tx_sends\":4321");
@@ -682,6 +703,7 @@ TEST(get_stats_client_mode_connected)
     ASSERT_CONTAINS(resp, "\"udp_rx_receives\":61");
     ASSERT_CONTAINS(resp, "\"udp_rx_datagrams\":83");
 
+    memset(&g_stream_diag, 0, sizeof(g_stream_diag));
     g_cli_state = MQVPN_STATE_IDLE;
     g_cli_uptime = 0;
 }
@@ -696,6 +718,7 @@ TEST(get_stats_client_mode_not_connected)
     call_dispatch_client("{\"cmd\":\"get_stats\"}", resp, sizeof(resp));
     ASSERT_CONTAINS(resp, "\"ok\":true");
     ASSERT_CONTAINS(resp, "\"n_clients\":0");
+    ASSERT_CONTAINS(resp, "\"stream_diag\":{\"available\":0");
     g_cli_state = MQVPN_STATE_IDLE;
 }
 

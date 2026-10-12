@@ -2288,8 +2288,8 @@ TEST(mqvpn_tcp_relay_error_stops_fd_dispatch)
  * 16 MiB, so without a cap that much can wait unsent in the sender. Here no
  * harness_pump runs after the 200, so no ACK reaches the probe: what it
  * sends is held to its initial congestion window (32 packets under BBR2),
- * and the rest of what send_body accepts is unsent backlog, which must stop
- * at MQVPN_STREAM_UNSENT_PACKETS packets. */
+ * and the rest of what send_body accepts across several streams is unsent
+ * backlog, which must stop at MQVPN_STREAM_UNSENT_PACKETS packets. */
 TEST(mqvpn_tcp_uplink_backlog_stops_at_unsent_cap)
 {
     tcp_sink_t sink;
@@ -2316,12 +2316,23 @@ TEST(mqvpn_tcp_uplink_backlog_stops_at_unsent_cap)
      * the test. */
     static uint8_t chunk[65536];
     memset(chunk, 0xA5, sizeof(chunk));
+    /* Each stream now has a smaller receive window. Open enough streams
+     * to distinguish that legitimate per-stream block from the aggregate
+     * unsent-packet cap; no network pump/ACK can replenish the queue. */
+    xqc_h3_request_t *requests[16];
+    requests[0] = h.probe.req;
+    for (size_t i = 1; i < 16; i++) {
+        ASSERT_EQ(probe_open_request_with_body(&h.probe), 0);
+        requests[i] = h.probe.req;
+    }
     size_t accepted = 0;
-    while (accepted < 24u * 1024 * 1024) {
-        ssize_t sent = xqc_h3_request_send_body(h.probe.req, chunk, sizeof(chunk), 0);
-        if (sent == -XQC_EAGAIN) break;
-        ASSERT_EQ(sent > 0, 1);
-        accepted += (size_t)sent;
+    for (size_t i = 0; i < 16; i++) {
+        while (accepted < 24u * 1024 * 1024) {
+            ssize_t sent = xqc_h3_request_send_body(requests[i], chunk, sizeof(chunk), 0);
+            if (sent == -XQC_EAGAIN) break;
+            ASSERT_EQ(sent > 0, 1);
+            accepted += (size_t)sent;
+        }
     }
     /* The cap plus two initial windows: room for the packets already sent
      * and for any cwnd growth from handshake ACKs. */

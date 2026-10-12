@@ -7,6 +7,7 @@
  */
 
 #include "mqvpn_conn_settings.h"
+#include "mqvpn_stream_limits.h"
 
 #include "libmqvpn.h"
 #include "mqvpn_internal.h"
@@ -159,6 +160,13 @@ mqvpn_build_conn_settings(const mqvpn_conn_settings_input_t *in, xqc_conn_settin
      * multipath FIXME) then marks a path with an empty buffer app-limited,
      * so BBR stops raising its bandwidth estimate. */
     out->max_stream_unsent_packets = MQVPN_STREAM_UNSENT_PACKETS;
+    /* Unread H3 DATA retains credit. xquic's aggregate budget is twice
+     * h3_body_recv_window, independently of the smaller stream ceiling.
+     * Extra connection headroom keeps stalled readers from consuming the
+     * fast readers' entire budget; it is allocated only as data arrives. */
+    out->h3_body_recv_window = MQVPN_H3_CONN_RECV_WINDOW / 2;
+    out->h3_body_stream_initial_window = MQVPN_H3_STREAM_INITIAL_WINDOW;
+    out->h3_body_stream_recv_window = MQVPN_H3_STREAM_RECV_WINDOW;
 
     /* Caller-gated, never derived here: see the field comment in
      * mqvpn_conn_settings.h for why this must equal the batched-send
