@@ -1484,6 +1484,38 @@ TEST(client_add_path_max)
 
 /* ── TUN control ── */
 
+extern int mqvpn_client_test_conn_alloc(mqvpn_client_t *c);
+extern int mqvpn_client_test_conn_free(mqvpn_client_t *c);
+extern int mqvpn_client_test_set_backpressure(mqvpn_client_t *c, int blocked);
+
+TEST(client_backpressure_reconnect)
+{
+    mqvpn_client_t *c = make_test_client();
+    mqvpn_interest_t interest;
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+    ASSERT_EQ(mqvpn_client_set_tun_active(c, 1, 5), MQVPN_OK);
+    ASSERT_EQ(mqvpn_client_test_set_backpressure(c, 1), 0);
+    mqvpn_client_get_interest(c, &interest);
+    ASSERT_EQ(interest.tun_readable, 0);
+
+    /* Merely replacing a TUN must not bypass a still-blocked connection. */
+    ASSERT_EQ(mqvpn_client_set_tun_active(c, 0, -1), MQVPN_OK);
+    ASSERT_EQ(mqvpn_client_set_tun_active(c, 1, 6), MQVPN_OK);
+    mqvpn_client_get_interest(c, &interest);
+    ASSERT_EQ(interest.tun_readable, 0);
+
+    /* Reconnect destroys the queue that requested the pause. A writable
+     * callback from that old connection can never wake the new TUN. */
+    ASSERT_EQ(mqvpn_client_set_tun_active(c, 0, -1), MQVPN_OK);
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    ASSERT_EQ(mqvpn_client_test_conn_alloc(c), 0);
+    ASSERT_EQ(mqvpn_client_set_tun_active(c, 1, 7), MQVPN_OK);
+    mqvpn_client_get_interest(c, &interest);
+    ASSERT_EQ(interest.tun_readable, 1);
+    ASSERT_EQ(mqvpn_client_test_conn_free(c), 0);
+    mqvpn_client_destroy(c);
+}
+
 TEST(client_set_tun_active)
 {
     mqvpn_client_t *c = make_test_client();
@@ -4765,6 +4797,7 @@ main(void)
 
     /* TUN control tests */
     run_client_set_tun_active();
+    run_client_backpressure_reconnect();
 
     /* I/O feed tests */
     run_client_on_tun_packet_null();

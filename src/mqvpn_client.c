@@ -798,6 +798,17 @@ mqvpn_client_test_conn_free(mqvpn_client_t *c)
     return 0;
 }
 
+/* Test-only pressure injection; exercise the real connection teardown and
+ * public TUN-interest contract without filling a live transport queue. */
+MQVPN_INTERNAL
+int
+mqvpn_client_test_set_backpressure(mqvpn_client_t *c, int blocked)
+{
+    if (!c || !c->conn) return -1;
+    c->backpressure = !!blocked;
+    return 0;
+}
+
 MQVPN_INTERNAL
 int
 mqvpn_client_test_conn_tunnel_notified(const mqvpn_client_t *c)
@@ -3678,6 +3689,12 @@ cli_conn_destroy(mqvpn_client_t *c)
 
     free(conn);
     c->conn = NULL;
+
+    /* DATAGRAM backpressure belongs to the old connection's send queue.
+     * Its writable notification cannot resume a new connection's TUN after
+     * teardown. Clear the latch without notifying ready_for_tun while the
+     * platform is still dismantling the old TUN. */
+    c->backpressure = 0;
 }
 
 /* ─── Scheduler precondition predicate (used by client + server) ─── */
